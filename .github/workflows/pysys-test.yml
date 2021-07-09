@@ -10,7 +10,8 @@ on:
       - "master"
       - "release"
       - "doc-updates"
-    
+      - "debugging"
+
   pull_request:
     branches:
       - "master"
