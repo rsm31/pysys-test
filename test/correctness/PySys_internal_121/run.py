@@ -25,7 +25,14 @@ pythonCoverage
 codeCoverage
 waitForSignal
 logFileContentsDefaultExcludes
+getExprFromFile
 pysys
+threadPoolMaxWorkers
+isInterruptTerminationInProgress
+isInterruptTerminationInProgressEvent
+isInterruptTerminationInProgressHandle
+grepWarnIfLineLongerThan
+grepTruncateIfLineLongerThan
 		""".strip().split('\n')
 
 		def filter_member(m):
@@ -49,7 +56,7 @@ pysys
 		if len(docdir)==1: 
 			docdir = docdir[0]
 		else:
-			docdir = pysysroot+'/docs'
+			docdir = pysysroot+'/docs/pysys'
 		self.log.info('Checking completeness of %s/BaseTest.rst', docdir)
 		with codecs.open(docdir+'/BaseTest.rst', 'r', encoding='ascii') as f: # this also serves to check we don't have non-ascii chars creeping in
 			for l in f:
@@ -60,7 +67,7 @@ pysys
 				if m: attr.add(m.group(2))
 				m = re.search('- ``self.([a-zA-Z0-9_]+)`` ', l) # this is how we doc ivar's currently
 				if m: attr.add(m.group(1))
-		self.write_text('basetest.doc.txt', '\n'.join(sorted(attr))+'\n\n'+'\n'.join(sorted(members)))
+		self.write_text('basetest.doc.txt', '\n'.join(sorted(a for a in attr if not a.startswith('isInterruptTerminationInProgress') ))+'\n\n'+'\n'.join(sorted(members)))
 		
 	def validate(self):
 		self.assertGrep('basetest.doc.txt', expr='.') # check it's not empty

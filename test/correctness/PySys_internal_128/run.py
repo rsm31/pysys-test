@@ -15,7 +15,7 @@ class PySysTest(BaseTest):
 
 		block = self.startTestProcess(stdouterr='timeout', arguments=['block'], background=True)
 		self.waitForBackgroundProcesses(excludes=[block])
-		block.stop()
+		block.stop(hard=True) # doesn't have to be hard, but this is a good place to check that works
 		del self.processList[:]
 
 		self.startTestProcess(stdouterr='failure1', background=True)
@@ -39,6 +39,9 @@ class PySysTest(BaseTest):
 
 		self.addOutcome(PASSED, override=True)
 		def m(line):
+			line = re.sub(r'\[[^\]]*run.py', '[run.py', line) # in case there is an absolute path
+			line = line.replace('for (0|1) background process', 'for 0|1 background process')
+    
 			line = re.sub('[0-9.]+ secs', 'N secs', line)
 			if ' WARN ' in line: 
 				line = line[line.find(' WARN ')+1:]

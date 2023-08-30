@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-# PySys System Test Framework, Copyright (C) 2006-2020 M.B. Grieve
+# PySys System Test Framework, Copyright (C) 2006-2022 M.B. Grieve
 
 # This library is free software; you can redistribute it and/or
 # modify it under the terms of the GNU Lesser General Public
@@ -33,10 +33,7 @@ def stripANSIEscapeCodes(text):
 	"""
 	if not text: return text
 	
-	if PY2 and isinstance(text, binary_type):
-		return re.sub(b'\\033\\[[0-9;]+m', b'', text)
-	else:
-		return re.sub(u'\\033\\[[0-9;]+m', u'', text)
+	return re.sub(u'\\033\\[[0-9;]+m', u'', text)
 
 class BaseLogFormatter(logging.Formatter):
 	"""Base class for formatting log messages.
@@ -44,6 +41,14 @@ class BaseLogFormatter(logging.Formatter):
 	This implementation delegates everything to logging.Formatter using the messagefmt and datefmt
 	properties. Subclasses may be implemented to provide required customizations, and can be registered
 	by specifying classname in the formatter node of the project configuration file.
+	
+	The class is constructed with a dictionary of properties, which are configured by providing
+	<property name="..." value="..."/> elements or attributes on the formatter node of the project
+	configuration file. Entries in the properties should be specific to the class, and removed
+	when passing the properties to the super class, which will throw an exception if any unexpected
+	options are present
+	
+	:param propertiesDict: dictionary of formatter-specific options
 	"""
 
 	# the key to add to the extra={} dict of a logger call to specify the category
@@ -52,33 +57,30 @@ class BaseLogFormatter(logging.Formatter):
 	# the key to add to the extra={} dict of a logger call to specify the arg index for the category
 	ARG_INDEX = 'log_arg_index'
 
+	# the key to add to the extra={} dict of a logger call to skip the timestamp and log level prefix and just format the message
+	SUPPRESS_PREFIX = 'pysys_log_suppressPrefix'
+
 	@classmethod
-	def tag(cls, category, arg_index=None):
+	def tag(cls, category, arg_index=None, suppress_prefix=False):
 		"""Return  dictionary to tag a string to format with color encodings.
 
 		:param category: The category, as defined in L{ColorLogFormatter.COLOR_CATEGORIES}
 		:param arg_index: The index of argument in the string expansion to color. This can be either a single
 			integer value representing the index, or a list of integers representing a set of indexes to be colored. 
 			Note that format arguments for coloring must be of string type. 
+		:param bool suppress_prefix: Set to True to suppress the timestamp and log level prefix, to save horizontal space 
+			on the console. Only do this for log lines where you're sure these details aren't needed, for example where a 
+			preceding log line with those details) has already been printed and there is no chance of other threads writing 
+			interleaving lines to the same device. 
+			This flag only affects the colored formatter (as used on the console). Added in v2.1. 
 		:return: A dictionary that can then be used in calls to the logger
 		"""
-		if type(arg_index) is int: return {cls.CATEGORY:category, cls.ARG_INDEX:[arg_index]}
-		if type(arg_index) is list and all(isinstance(i, int) for i in arg_index): return {cls.CATEGORY:category, cls.ARG_INDEX:arg_index}
-		return {cls.CATEGORY:category}
+		if type(arg_index) is int: return {cls.CATEGORY:category, cls.ARG_INDEX:[arg_index], cls.SUPPRESS_PREFIX:suppress_prefix}
+		if type(arg_index) is list and all(isinstance(i, int) for i in arg_index): return {cls.CATEGORY:category, cls.ARG_INDEX:arg_index, cls.SUPPRESS_PREFIX:suppress_prefix}
+		return {cls.CATEGORY:category, cls.SUPPRESS_PREFIX:suppress_prefix}
 
 
 	def __init__(self, propertiesDict):
-		"""Create an instance of the formatter class.
-
-		The class is constructed with a dictionary of properties, which are configured by providing
-		<property name="..." value="..."/> elements or attributes on the formatter node of the project
-		configuration file. Entries in the properties should be specific to the class, and removed
-		when passing the properties to the super class, which will throw an exception if any unexpected
-		options are present
-		
-		:param propertiesDict: dictionary of formatter-specific options
-
-		"""
 		self.name = propertiesDict.pop('name', None) # probably not used
 		
 		__formatterName = propertiesDict.pop('__formatterName', None)
@@ -126,6 +128,8 @@ class ColorLogFormatter(BaseLogFormatter):
 		LOG_PASSES: 'GREEN',
 		LOG_SKIPS: 'YELLOW',
 		LOG_DIFF_ADDED: 'CYAN', LOG_DIFF_REMOVED: 'MAGENTA', # can't use red/green here without confusion with fail/pass
+		LOG_PERF_BETTER:'GREEN', LOG_PERF_WORSE:'RED',
+		
 		LOG_END:'END',
 	}
 	
@@ -209,7 +213,8 @@ class ColorLogFormatter(BaseLogFormatter):
 			with ColorLogFormatter.__STDOUT_LOCK:
 				stdoutbak = sys.stdout
 				try:
-					sys.stdout = sys.__stdout__
+					# (nb for pysys print the underlying stream might in fact be stderr, so this is dicey but does seem to work)
+					sys.stdout = stdoutHandler.stream.getUnderlyingStream() 
 					self.initColoringLibrary()
 				finally:
 					updatedstdout = sys.stdout
@@ -269,9 +274,11 @@ class ColorLogFormatter(BaseLogFormatter):
 						for index in indexes: args[index] = self.formatArg(cat, args[index])
 						record.args = tuple(args)
 					
-			except Exception as e:
+			except Exception as e: # pragma: no cover
 				logging.getLogger('pysys.utils.logutils').debug('Failed to format log message "%s": %s'%(record.msg, repr(e)))
 
+		if getattr(record, self.SUPPRESS_PREFIX, False):
+			return record.msg % record.args
 		return super(ColorLogFormatter, self).format(record)
 
 

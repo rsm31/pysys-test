@@ -21,8 +21,7 @@ import sys, os, io, locale, logging, threading
 
 # must not import any pysys packages here, as this module's code needs to execute first
 
-PY2 = sys.version_info[0] == 2
-binary_type = str if PY2 else bytes
+binary_type = bytes
 
 _PREFERRED_ENCODING = locale.getpreferredencoding() # also exists in pysys.constants.
 
@@ -49,6 +48,8 @@ class _UnicodeSafeStreamWrapper(object):
 		self.__requestedEncoding = encoding
 		self.updateUnderlyingStream(underlying)
 	
+	def getUnderlyingStream(self): return self.stream
+
 	def updateUnderlyingStream(self, underlying):
 		assert underlying != self # avoid infinite loops
 		self.stream = underlying
@@ -94,10 +95,13 @@ class _UnicodeSafeStreamWrapper(object):
 		stream.flush()
 		stream.close()
 
+_unregisteredThreadLogHandler = logging.StreamHandler(sys.stdout)
+_unregisteredThreadLogHandler.setFormatter(logging.Formatter('<PySys logger for unregistered thread> %(asctime)s [%(threadName)s] at "%(pathname)s":%(lineno)d %(levelname)-5s %(message)s')) # formatter to use for any debug/error messages, just until we load the project file
+
 class DelegatingPerThreadLogHandler(logging.Handler):
 	"""A log handler that delegates emits to a list of handlers, 
 	set on a per-thread basis. If no handlers are setup for this 
-	thread nothing is emitted.
+	thread the _unregisteredThreadLogHandler is used.
 	
 	Note that calling close() on this handler does not call close 
 	on any of the delegated handlers (since they may 
@@ -113,11 +117,13 @@ class DelegatingPerThreadLogHandler(logging.Handler):
 		self.__threadLocals.emitFunctions = [(h.level, h.emit) for h in handlers] if handlers else None
 
 	def getLogHandlersForCurrentThread(self):
-		return getattr(self.__threadLocals, 'handlers', None) or []
+		return getattr(self.__threadLocals, 'handlers', []) or []
 	
 	def emit(self, record):
 		functions = getattr(self.__threadLocals, 'emitFunctions', None) 
-		if functions is not None: 
+		if functions is None:
+			_unregisteredThreadLogHandler.emit(record)
+		else: 
 			for (hdlrlevel, emitFunction) in functions:
 				# handlers can have different levels, so need to replicate the checking that callHandlers performs
 				if record.levelno >= hdlrlevel:
@@ -156,17 +162,19 @@ class ThreadFilter(logging.Filterer):
 # subsequent logging if no handlers are defined
 logging.getLogger().addHandler(logging.NullHandler())
 
-rootLogger = logging.getLogger('pysys')
+rootLogger = logging.getLogger(
+	# PYSYS_SUPPRESS_OTHER_LOGGING is undocumented, and exists 'just in case' this v2.1 change breaks someone
+	'pysys' if os.getenv('PYSYS_SUPPRESS_OTHER_LOGGING','')=='true' else None) 
 """The root logger for logging within PySys."""
 
 log = rootLogger
 
-stdoutHandler = logging.StreamHandler(_UnicodeSafeStreamWrapper(sys.stdout, writebytes=PY2))
-"""The handler that sends pysys.* log output from to stdout, 
+stdoutHandler = logging.StreamHandler(_UnicodeSafeStreamWrapper(sys.stderr if len(sys.argv)>=2 and sys.argv[1] in ['print', 'debug'] else sys.stdout, writebytes=False))
+"""The handler that sends pysys.* log output from to the console, 
 including buffered output from completed tests when running in parallel.
 
 The .stream field can be used to access the wrapper we use throughout 
-pysys to safely write to stdout (with coloring support if enabled). 
+pysys to safely write to the console (with coloring support if enabled). 
 """
 
 pysysLogHandler = DelegatingPerThreadLogHandler()
@@ -182,4 +190,3 @@ stdoutHandler.setFormatter(logging.Formatter('%(levelname)s %(message)s')) # for
 rootLogger.setLevel(logging.INFO) # The default root logger log level 
 rootLogger.addHandler(pysysLogHandler)
 pysysLogHandler.setLogHandlersForCurrentThread([stdoutHandler]) # main thread is by default the only one that writes to stdout
-

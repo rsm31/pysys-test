@@ -1,7 +1,8 @@
+import glob
+import json
 import pysys
 from pysys.constants import *
 from pysys.basetest import BaseTest
-from pysys.utils.pycompat import PY2
 
 if PROJECT.testRootDir+'/internal/utilities/extensions' not in sys.path:
 	sys.path.append(PROJECT.testRootDir+'/internal/utilities/extensions') # only do this in internal testcases; normally sys.path should not be changed from within a PySys test
@@ -11,24 +12,22 @@ class PySysTest(BaseTest):
 
 	def execute(self):
 		if sys.version_info[0:2] < tuple([3,6]): self.skipTest('Samples work on Python 3.6+ only')
-		
+
 		sampledir = self.project.testRootDir+'/../samples/cookbook'
+
 		def pysys(name, args, **kwargs):
 			if args[0] == 'run': args = args+['-o', self.output+'/'+name]
 			runPySys(self, name, args, workingDir=sampledir+'/test', 
 				# this is so we can run git
 				environs={'PATH':os.environ['PATH']}, 
+				disableCoverage=True, # the COVERAGE_FILE setting from the top-level run stops the coverage gen within the cookbook pysys going to the right place so disable
 				**kwargs)
 
 		# The command below is copied verbatim from the README.md
-		runcmd = 'run -j0 --record -XcodeCoverage --type=auto'
+		runcmd = 'run -j0 --record -XcodeCoverage --exclude=manual'
 		self.assertGrep(sampledir+'/README.md', runcmd)
+		self.log.info('Running the cookbook sample: pysys %s'%runcmd)
 		pysys('pysys-run-tests', runcmd.split(' '), ignoreExitStatus=True)
-		
-		pysys('pysys-print', ['print'], background=True)
-		pysys('pysys-print-descriptor-samples', ['print', '--full', 'PySysDirConfigSample', 'PySysTestDescriptorSample'], background=True)
-		pysys('pysys-run-help', ['run', '-h'], background=True)
-		self.waitForBackgroundProcesses()
 		
 		# delete sample coverage files so we don't pick them up and use them for PySys itself
 		for root, dirs, files in os.walk(self.output):
@@ -36,10 +35,11 @@ class PySysTest(BaseTest):
 				if '.coverage' in f:
 					os.remove(root+os.sep+f)
 
-
 	def validate(self):	
 		outdir = self.output+'/pysys-run-tests'
 		
+		self.assertGrep('pysys-run-tests.err', 'ERROR', contains=False) # for FATAL ERRORs
+
 		# Check we got the expected outcomes and outcome reasons
 		self.write_text('non-passes.txt', '\n'.join(sorted(["{r[testId]} = {r[outcome]}: {r[outcomeReason]}".format(r=r) for r in
 			pysys.utils.fileutils.loadJSON(outdir+'/__pysys_myresults.pysys-run-tests.json')['results']
@@ -68,14 +68,13 @@ class PySysTest(BaseTest):
 		self.assertGrep('pysys-run-tests.out', 'MyRunner.setup was called; myRunnerArg=12345')
 		self.assertGrep('pysys-run-tests.out', 'MyRunner.cleanup was called')
 
-		# Sample descriptors
-		self.assertDiff(self.copy('pysys-print-descriptor-samples.out', 'descriptor-samples.txt', mappers=[
-			lambda line: line if line.startswith(
-				tuple('Test id,Test state,Test skip reason,Test groups,Test modes,Test module,Test input,Test output,Test reference,Test traceability,Test user data'.split(','))
-			) else None,
-			pysys.mappers.RegexReplace(' [^ ]+pysys-extensions', ' <rootdir>/pysys-extensions')]))
+		if self.assertThat('len(performanceFiles)==2 and ".json" in "".join(performanceFiles)', performanceFiles=glob.glob(outdir+'/__pysys_performance/*/*')):
+			# check it's valid json
+			with open(glob.glob(outdir+'/__pysys_performance/*/*.json')[0]) as f:
+				json.load(f)
 		
-		self.logFileContents('pysys-run-help.out', tail=True)
-		self.logFileContents('pysys-run-tests.out', tail=False)	
-		self.logFileContents('pysys-run-tests.out', tail=True, maxLines=50)
-		self.logFileContents('pysys-print.out', tail=True, maxLines=0)
+		# Check the code coverage include filter worked
+		self.assertGrep(outdir+'/__coverage_python.pysys-run-tests/python-coverage-combine.out', 'PyUnitTest')
+		self.assertGrep(outdir+'/__coverage_python.pysys-run-tests/python-coverage-combine.out', 'Outcome_FailedAssertions')
+		self.assertGrep(outdir+'/__coverage_python_unit_tests.pysys-run-tests/python-coverage-combine.out', 'PyUnitTest')
+		self.assertGrep(outdir+'/__coverage_python_unit_tests.pysys-run-tests/python-coverage-combine.out', 'Outcome_FailedAssertions', contains=False)

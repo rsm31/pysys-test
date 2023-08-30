@@ -1,4 +1,4 @@
-# PySys System Test Framework, Copyright (C) 2006-2020 M.B. Grieve
+# PySys System Test Framework, Copyright (C) 2006-2022 M.B. Grieve
 
 # This library is free software; you can redistribute it and/or
 # modify it under the terms of the GNU Lesser General Public
@@ -26,7 +26,7 @@ from pysys import log
 
 from pysys import __version__
 from pysys.constants import *
-from pysys.xml.project import getProjectConfigTemplates, createProjectConfig
+from pysys.config.project import getProjectConfigTemplates, createProjectConfig
 from pysys.exceptions import UserError
 
 

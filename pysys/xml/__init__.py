@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-# PySys System Test Framework, Copyright (C) 2006-2020 M.B. Grieve
+# PySys System Test Framework, Copyright (C) 2006-2022 M.B. Grieve
 
 # This library is free software; you can redistribute it and/or
 # modify it under the terms of the GNU Lesser General Public
@@ -15,10 +15,8 @@
 # License along with this library; if not, write to the Free Software
 # Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
 
+""":meta private: Deprecated from 2.0 onwards and replaced by the pysys.config module ."""
 
-"""
-Test/directory descriptors (``pysystest.xml``/``pysysdirconfig.xml``) and project configuration (``pysysproject.xml``)."""
+# Exists for compatibility with Pysys <= 1.6.1 before the xml module was renamed to config
+__all__ = [ "descriptor", "project", "manual" ]
 
-__all__ = [ "descriptor",
-			"project",
-			"manual" ]

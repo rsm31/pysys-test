@@ -1,4 +1,4 @@
-# PySys System Test Framework, Copyright (C) 2006-2020 M.B. Grieve
+# PySys System Test Framework, Copyright (C) 2006-2022 M.B. Grieve
 
 # This library is free software; you can redistribute it and/or
 # modify it under the terms of the GNU Lesser General Public
@@ -29,7 +29,7 @@ from pysys import __version__
 from pysys.constants import *
 from pysys.launcher import createDescriptors, MODE_CHARS
 from pysys.exceptions import UserError
-from pysys.xml.project import Project
+from pysys.config.project import Project
 
 class ConsolePrintHelper(object):
 	def __init__(self, workingDir, name=""):
@@ -41,6 +41,7 @@ class ConsolePrintHelper(object):
 		self.requirements = False
 		self.json = False
 		self.modefilter = [] # select based on mode
+		self.printOnly = []
 		self.type = None
 		self.trace = None
 		self.includes = []
@@ -49,8 +50,8 @@ class ConsolePrintHelper(object):
 		self.name = name
 		self.sort = None
 		self.grep = None
-		self.optionString = 'hfgdrm:a:t:i:e:s:G:'
-		self.optionList = ["help","full","groups","modes","requirements","mode=","type=","trace=","include=","exclude=", "json", "sort=", "grep="] 
+		self.optionString = 'hfgdrm:a:t:i:e:s:G:DT'
+		self.optionList = ["help","full","groups","modes","requirements","dir", "title", "mode=","type=","trace=","include=","exclude=", "json", "sort=", "grep="] 
 		
 
 	def printUsage(self):
@@ -63,12 +64,16 @@ class ConsolePrintHelper(object):
 		print("       -h | --help                 print this message")
 		print("")
 		print("    output options:")
-		print("       -f | --full                 print full information")
-		print("       -g | --groups               print test groups defined")
-		print("       -d | --modes                print test modes defined")
-		print("       -r | --requirements         print test requirements covered")
-		print("       -s | --sort   STRING        sort by: title, id, executionOrderHint")
+		print("       -f | --full                 print full information for each test (multi-line)")
 		print("            --json                 print full information as JSON")
+		print("       -D | --dir                  print the absolute path for each test directory")
+		print("       -T | --title                print the test id and title for each test")
+		print("")
+		print("       -g | --groups               print all test groups")
+		print("       -d | --modes                print all modes")
+		print("       -r | --requirements         print all test requirements")
+		print("")
+		print("       -s | --sort   STRING        sort by: title, id, executionOrderHint")
 		print("")
 		print("    selection/filtering options:")
 		print("       -G | --grep      STRING     print only tests whose title or id contains the specified regex")
@@ -76,7 +81,7 @@ class ConsolePrintHelper(object):
 		print("       -m | --mode      STRING     print only tests that run in the specified mode(s)")
 		print("                                   (use ! for excludes e.g. -m MyMode1,MyMode2,Other.* or -m !MyMode3)")
 		print("       -a | --type      STRING     print only tests of supplied type (auto or manual, default all)")
-		print("       -t | --trace     STRING     print only tests which cover requirement id ") 
+		print("       -t | --trace     STRING     print only tests which cover specified requirement tracing id ") 
 		print("       -i | --include   STRING     print only tests in included group (can be specified multiple times)")
 		print("       -e | --exclude   STRING     do not print tests in excluded group (can be specified multiple times)")
 		print("")
@@ -86,12 +91,14 @@ class ConsolePrintHelper(object):
 		print("   tests in the group will not be run. The following syntax is used to select a test set;")
 		print("")
 		print("       test1    - a single testcase with id test1")
-		print("       :test2   - upto testcase with id test2")
+		print("       :test2   - up to testcase with id test2")
 		print("       test1:   - from testcase with id test1 onwards")
 		print("       id1:id2  - all tests between tests with ids test1 and test2")
 		print("")
-		print("   e.g. ")
+		print("   e.g. To print full information about tests with specified include/exclude groups and range:")
 		print("       %s -i group1 -e group2 --full test1:test3" % _PYSYS_SCRIPT_NAME)
+		print("   e.g. To print titles and directories for tests in a particular group:")
+		print("       %s -TD -i group1 " % _PYSYS_SCRIPT_NAME)
 		print("")
 		sys.exit()
 
@@ -109,6 +116,12 @@ class ConsolePrintHelper(object):
 
 			elif option in ("-f", "--full"):
 				self.full = True
+				
+			elif option in ('-D', '--dir'):
+				self.printOnly.append('dir')
+
+			elif option in ('-T', '--title'):
+				self.printOnly.append('title')
 				
 			elif option in ("-g", "--groups"):
 				self.groups = True
@@ -186,7 +199,7 @@ class ConsolePrintHelper(object):
 							groups.append(group)
 				print("\nGroups defined: ")
 				for group in groups:
-					print("                 %s" % (group))
+					print("  %s" % (group))
 				exit = 1
 
 			if self.modes == True:
@@ -197,7 +210,7 @@ class ConsolePrintHelper(object):
 							modes.append(mode)
 				print("\nModes defined: ")
 				for mode in modes:
-					print("                 %s" % (mode))
+					print("  %s" % (mode))
 				exit = 1
 
 			if self.requirements == True:
@@ -206,9 +219,9 @@ class ConsolePrintHelper(object):
 					for requirement in descriptor.traceability:
 						if requirement not in requirements:
 							requirements.append(requirement)
-				print("\nRequirements covered: ")
+				print("\nTraceability requirement ids covered: ")
 				for requirement in requirements:
-					print("                 %s" % (requirement))
+					print("  %s" % (requirement))
 				exit = 1
 		
 			if exit: return
@@ -218,20 +231,16 @@ class ConsolePrintHelper(object):
 				if len(descriptor.id) > maxsize: maxsize = len(descriptor.id)
 			maxsize = maxsize + 2
 			
-			supportMultipleModesPerRun = Project.getInstance().getProperty('supportMultipleModesPerRun', True)
-			if self.modefilter and not supportMultipleModesPerRun:
-				self.modefilter = ','.join(self.modefilter)
-				descriptors = [d for d in descriptors if self.modefilter in d.modes]
-
 			for descriptor in descriptors:
 				padding = " " * (maxsize - len(descriptor.id))
-				if not self.full:
-					print("%s%s| %s" % (descriptor.id, padding, descriptor.title))
-				else:
-					print("==========================================")
-					print("		" + descriptor.id)
-					print("==========================================")
+				if self.full:
+					print("="*80)
 					print(descriptor)
+				else:
+					if not self.printOnly or 'title' in self.printOnly:
+						print("%s%s| %s" % (descriptor.id, padding, descriptor.title))
+					if 'dir' in self.printOnly:
+						print("%s%s" % ('   ' if len(self.printOnly)>1 else '', os.path.abspath(descriptor.testDir)))
 
 def printTest(args):
 	try:

@@ -1,0 +1,62 @@
+Test Descriptors
+================
+
+Each PySys test has a file named ``pysystest.*`` which contains the test descriptor information such as the title, 
+whether it is skipped, modes it runs in, etc. This information is all stored in a 
+`TestDescriptor <pysys.config.descriptor.TestDescriptor>` instance, which can be accessed within each test using 
+``self.descriptor``. 
+
+It is possible to configure the descriptor values in an XML file (``pysystest.xml``) separate to your Python 
+(e.g. ``run.py``) but it is recommended in modern PySys projects to put the descriptor information and your test code 
+into a single file, typically called ``pysystest.py``. 
+
+Sample pysystest.py
+-------------------
+
+Each descriptor value is populated with a ``__pysys_KEY__ = VALUE`` line. 
+
+.. code-block:: python
+@PYSYSTESTPYTHON@
+
+This is intended as a reference, and to provide somewhere to copy snippets from as needed. Do not copy the whole thing 
+into your own tests as this example contains many fields that are only used for advanced cases. Instead use 
+``pysys make`` to create new tests. 
+
+For more information about the modes ``helper`` shown above, see `pysys.config.descriptor.TestModesConfigHelper`. 
+
+All descriptor values should go at the start of the file, before any ``import`` statements - this is important for 
+efficient parsing. For optimum parsing performance, make sure your first import is an ``import XXX`` rather than a 
+``from XXX import YYY`` statement. 
+
+It is mandatory to provide a ``__pysys_title__`` value, but everything else is optional. For ease of readability and 
+performance it is best to use ``#`` to comment out any items where you aren't setting a (non-default) value. 
+
+Non-Python files can include descriptor values using the same syntax, but since they are parsed with regular 
+expressions rather than Python, all values (except numbers/booleans) must be wrapped in a string, ideally a 
+``r""" ... """`` string. In non-Python files these can appear at any position in the file, for example inside a class 
+or a comment. For example ``pysystest.cs`` for C#/ECMAScript (either embedded within a C# comment 
+or as fields of your C# class). 
+
+Sample pysystest.xml
+--------------------
+
+The following sample illustrates all the possible configuration options for a test's ``pysystest`` file when 
+using standalone XML (instead of ``pysystest.py``), i.e. ``pysystest.xml``. This is just different (XML) syntax for the 
+same capabilities described above for ``pysystest.py``. 
+
+.. code-block:: xml
+@PYSYSTESTXML@
+
+See the "cookbook" PySys sample that this XML file comes from to see how these work in practice. 
+
+Sample pysysdirconfig.xml
+-------------------------
+
+You can provide descriptor defaults for an entire subdirectory of tests by adding a ``pysysdirconfig.xml`` file, 
+which avoids the need to copy mode/group/id-prefix information into each individual test, reduces the chance of 
+mistakes, and makes it easier to add new modes and other setting later as your project evolves. 
+
+Most of the directory-level options are the same as ``pysystest.xml`` but there are a few options that don't make 
+sense at the directory level, and also additional options for directories such as ``id-prefix``. 
+
+@PYSYSDIRCONFIGXML@

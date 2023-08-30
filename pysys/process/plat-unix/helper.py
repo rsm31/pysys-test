@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-# PySys System Test Framework, Copyright (C) 2006-2020 M.B. Grieve
+# PySys System Test Framework, Copyright (C) 2006-2022 M.B. Grieve
 
 # This library is free software; you can redistribute it and/or
 # modify it under the terms of the GNU Lesser General Public
@@ -40,17 +40,16 @@ correct modules based on their current operation system.
 """
 
 import signal, time, copy, errno, threading, sys
-if sys.version_info[0] == 2:
-	import Queue
-else:
-	import queue as Queue
+import select
+import queue as Queue
 
 from pysys import log
 from pysys import process_lock
 from pysys.constants import *
 from pysys.exceptions import *
-from pysys.process import Process, _stringToUnicode
+from pysys.process import Process
 
+PYSYS_DISABLE_PROCESS_GROUP_CLEANUP = os.getenv('PYSYS_DISABLE_PROCESS_GROUP_CLEANUP','').lower()=='true' # undocumented option for disabling this when executed within another framework
 
 class ProcessImpl(Process):
 	"""Unix process wrapper for process execution and management. 
@@ -108,23 +107,15 @@ class ProcessImpl(Process):
 
 		# private instance variables
 		self.__lock = threading.Lock() # to protect access to the fields that get updated while process is running
+		self.pidfd = None
 
-
-	def writeStdin(self):
-		"""Thread method to write to the process stdin pipe.
-		
-		"""
-		while self._outQueue:
-			try:
-				data = self._outQueue.get(block=True, timeout=0.25)
-			except Queue.Empty:
-				if not self.running(): 
-					# no need to close stdin here, as previous call's setExitCode() method will do it
-					break
+	def _writeStdin(self, data):
+		with self.__lock:
+			if not self.__stdin: return
+			if data is None:
+				os.close(self.__stdin)
 			else:
-				with self.__lock:
-					if self.__stdin:
-						os.write(self.__stdin, data)	
+				os.write(self.__stdin, data)	
 	
 
 	def startBackgroundProcess(self):
@@ -139,7 +130,8 @@ class ProcessImpl(Process):
 
 				if self.pid == 0: # pragma: no cover
 					# create a new process group (same id as this pid) containing this new process, which we can use to kill grandchildren
-					os.setpgrp()
+					if not PYSYS_DISABLE_PROCESS_GROUP_CLEANUP:
+						os.setpgrp()
 				
 					# change working directory of the child process
 					os.chdir(self.workingDir)
@@ -169,6 +161,13 @@ class ProcessImpl(Process):
 					# and start a thread to write to the write end
 					os.close(stdin_r)
 					self.__stdin = stdin_w
+
+					try:
+						if hasattr(os, 'pidfd_open'): # only in Python 3.9+ and Linux kernel 5.3+ (e.g. RHEL9)
+							self.pidfd = os.pidfd_open(self.pid)
+							if self.pidfd == -1: self.pidfd = None
+					except Exception as ex:
+						log.debug('Failed to call os.pidfd_open: %r', ex)
 			except Exception as ex:
 				if self.pid == 0: 
 					sys.stderr.write('Failed with: %s\n'%ex)
@@ -178,6 +177,27 @@ class ProcessImpl(Process):
 		if not self.running() and self.exitStatus == os.EX_OSERR:
 			raise ProcessError("Error creating process %s" % (self.command))
 
+
+	def _pollWaitUnlessProcessTerminated(self):
+		# While waiting for process to terminate, modern Linux kernels (5.3+) give us a way to block for completion without polling, so we 
+		# can use a larger timeout to avoid wasting time in the Python GIL (but not so large as to stop us from checking for abort
+		owner = self.owner
+		if self.pidfd and owner.isInterruptTerminationInProgressHandle:
+			if owner and owner.isInterruptTerminationInProgress is True and owner.isCleanupInProgress is False: raise KeyboardInterrupt()
+
+			waitobjects = [ owner.isInterruptTerminationInProgressHandle, self.pidfd]
+
+			pollTimeoutMillis = 3000
+			if select.select(waitobjects, [], [], pollTimeoutMillis/1000.0)[0]: # if objects were signalled or got anything other than timeout/block, something was signalled so we won't be doing this again
+				with self.__lock:
+					# this is a fail-safe to ensure we do not spin calling select if some unexpected error occurred OR if we've been interrupt-terminated but are executing cleanup
+					if self.pidfd: os.close(self.pidfd)
+					self.pidfd = None
+
+			if owner and owner.isInterruptTerminationInProgress is True and owner.isCleanupInProgress is False: raise KeyboardInterrupt()
+			return
+		
+		self._pollWait(0.05) # fallback to a fixed sleep to avoid spinning if an unexpected return code is returned
 
 	def setExitStatus(self):
 		"""Tests whether the process has terminated yet, and updates and returns the exit status if it has. 
@@ -210,17 +230,27 @@ class ProcessImpl(Process):
 					try: os.close(self.__stdin)
 					except Exception: pass # just being conservative, should never happen
 					self.__stdin = None # MUST not close this more than once
+				if self.pidfd: 
+					os.close(self.pidfd)
+					self.pidfd = None
 
 			
 			return self.exitStatus
 
 
-	def stop(self, timeout=TIMEOUTS['WaitForProcessStop']):
+	def stop(self, timeout=TIMEOUTS['WaitForProcessStop'], hard=False):
 		"""Stop a process running.
+		
+		Uses SIGTERM to give processes a chance to gracefully exit including dump code coverage information if needed. 
 		
 		@raise ProcessError: Raised if an error occurred whilst trying to stop the process
 		
 		"""
+		# PySys has always done a non-hard SIGTERM on Unix; so far this seems ok but could cause problems for 
+		# poorly behaved processes that don't SIGTERM cleanly
+		
+		sig = signal.SIGKILL if hard else signal.SIGTERM
+		
 		try:
 			with self.__lock:
 				if self.exitStatus is not None: return 
@@ -228,20 +258,35 @@ class ProcessImpl(Process):
 				# do the kill before the killpg, as there's a small race in which we might try to stop a process 
 				# before it has added itself to its own process group, in which case this is essential to avoid 
 				# leaking
-				os.kill(self.pid, signal.SIGTERM)
+				os.kill(self.pid, sig)
 				
 				# nb assuming setpgrp was called when we forked, this will signal the entire process group, 
 				# so any children are also killed; small chance this could fail if the process was stopped 
 				# before it had a chance to create its process group
 				if not self.disableKillingChildProcesses:
 					try:
-						os.killpg(self.pid, SIGTERM)
-					except Exception as ex:
+						os.killpg(self.pid, sig)
+					except Exception as ex: # pragma: no cover
 						# Best not to worry about these
 						log.debug('Failed to kill process group (but process itself was killed fine) for %s: %s', self, ex)
 			
-			self.wait(timeout=timeout)
-		except Exception as ex:
-			raise ProcessError("Error stopping process: %s"%ex)
+			try:
+				self.wait(timeout=timeout)
+			except BaseException as ex: # pragma: no cover
+				# catch baseexception as we need to do this killing even for stuff like KeyboardInterrupt and SystemExit
+				# if it times out on SIGTERM, do our best to SIGKILL it anyway to avoid leaking processes, but still report as an error
+				if sig != signal.SIGKILL:
+					log.warning('Failed to SIGTERM process %r, will now SIGKILL the process group before re-raising the exception', self)
+					try:
+						os.killpg(self.pid, signal.SIGKILL)
+					except Exception as ex2:
+						log.debug('Failed to SIGKILL process group %r: %s', self, ex2)
+				
+				raise
+		except Exception as ex: # pragma: no cover
+			log.debug('Failed to stop process %r: ', self, exc_info=True)
+			raise ProcessError("Error stopping process %r due to %s: %s"%(self, type(ex).__name__, ex))
 
 ProcessWrapper = ProcessImpl # old name for compatibility
+
+log.debug("OS and python supports pidfd_open: %s", hasattr(os, 'pidfd_open'))

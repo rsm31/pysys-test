@@ -1,4 +1,4 @@
-# PySys System Test Framework, Copyright (C) 2006-2020 M.B. Grieve
+# PySys System Test Framework, Copyright (C) 2006-2022 M.B. Grieve
 
 # This library is free software; you can redistribute it and/or
 # modify it under the terms of the GNU Lesser General Public
@@ -33,7 +33,8 @@ from pysys.constants import *
 from pysys.launcher import createDescriptors
 from pysys.utils.fileutils import toLongPathSafe, fromLongPathSafe
 from pysys.exceptions import UserError
-from pysys.xml.project import Project
+from pysys.config.project import Project
+import pysys.utils.osutils
 
 class ConsoleLaunchHelper(object):
 	def __init__(self, workingDir, name=""):
@@ -50,13 +51,17 @@ class ConsoleLaunchHelper(object):
 		self.outsubdir = DEFAULT_OUTDIR
 		self.modeinclude = []
 		self.modeexclude = []
-		self.threads = 1
+		self.threads = '1' # as of 2.2 we leave this as a string and decide actual value later
 		self.name=name
 		self.userOptions = {}
 		self.descriptors = []
 		self.grep = None
-		self.optionString = 'hrpyv:a:t:i:e:c:o:m:n:j:b:X:gG:'
-		self.optionList = ["help","record","purge","verbosity=","type=","trace=","include=","exclude=","cycle=","outdir=","mode=","modeinclude=","modeexclude=","threads=", "abort=", 'validateOnly', 'progress', 'printLogs=', 'grep=', 'ci']
+		self.sort = None
+		self.optionString = 'hrpyv:a:t:i:e:c:o:m:n:j:b:X:gG:s:'
+		self.optionList = ["help","record","purge","verbosity=","type=","trace=","include=","exclude=","cycle=","outdir=",
+			"mode=","modeinclude=","modeexclude=","threads=", "abort=", 'validateOnly', 'vo', 'progress', 'printLogs=', 'grep=', 
+			'ci', 'sort=', 
+			]
 
 
 	def getProjectHelp(self):
@@ -111,9 +116,8 @@ Execution options
        --ci                    set optimal options for automated/non-interactive test execution in a CI job: 
                                  --purge --record -j0 --type=auto --mode=ALL --printLogs=FAILURES -XcodeCoverage
    -v, --verbosity LEVEL       set the verbosity for most pysys logging (CRIT, WARN, INFO, DEBUG)
-                   CAT=LEVEL   set the verbosity for a specific PySys logging category e.g. -vassertions=, -vprocess=
-                               (or to set the verbosity for a non-PySys Python logger category use "python:CAT=LEVEL")
-   -y, --validateOnly          test the validate() method without re-running execute()
+                   CAT=LEVEL   set the verbosity for a PySys/Python logging category e.g. -vassertions=, -vprocess=
+   -y, --validateOnly, --vo    test the validate() method without re-running execute()
    -h, --help                  print this message
  
    -Xkey[=value]               set user-defined override attributes to be set on the testcase and runner instances. The 
@@ -127,6 +131,7 @@ Advanced:
    -p, --purge                 purge files except run.log from the output directory to save space (unless test fails)
    --printLogs     STRING      indicates for which outcome types the run.log output will be printed to the stdout 
                                console; options are: all|none|failures (default is all).
+   -s, --sort      STRING      sort by: random (useful for performance testing and and reproducing test races)
    -b, --abort     STRING      set the default abort on error property (true|false, overrides 
                                that specified in the project properties)
    -XcodeCoverage              enable collecting and reporting on code coverage with all coverage writers in the project
@@ -144,12 +149,12 @@ Selection and filtering options
    -G, --grep      STRING      run only tests whose title or id contains the specified regex (case insensitive)
    -m, --mode, --modeinclude ALL,PRIMARY,!PRIMARY,MyMode1,!MyMode2,...
                                run tests in the specifies mode(s):
-                                 - use PRIMARY to select the test's first/main mode (this is the default)
+                                 - use PRIMARY to select the test's first/main mode(s) (this is the default)
                                  - use ALL to select all modes
                                  - use !MODE as an alias for modeexclude
                                  - regular expressions can be used
    --modeexclude MyMode1,MyMode2,...
-                               run tests excluding specified mode(s)
+                               run tests excluding specified mode(s); excludes take precedence over includes
    -a, --type      STRING      set the test type to run (auto or manual, default is both)"
    -t, --trace     STRING      set the requirement id for the test run
 
@@ -165,7 +170,7 @@ to select an individual test, or a sequence of numbered tests:
    Test_001                   - a single testcase with id equal to or ending with Test_001
    _001                       - a single testcase with id equal to or ending with _001
    1                          - a single testcase ending with number 1 (but not ending '11')
-                                (if it has multiple modes, runs the primary one, or uses --mode)
+                                (if it has multiple modes, runs the primary mode(s), or uses --mode)
    Test_001~ModeA             - run testcase with id Test_001 in ModeA
    :Test_002                  - all tests up to and including the testcase with id Test_002
    Test_001:                  - all tests from Test_001 onwards
@@ -194,12 +199,13 @@ e.g.
 		
 
 		printLogsDefault = PrintLogs.ALL
-		if '--ci' in args:
+		ci ='--ci' in args
+		if ci:
 			# to ensure identical behaviour, set these as if on the command line
 			# (printLogs we don't set here since we use the printLogsDefault mechanism to allow it to be overridden 
-			# by CI writers and/or the command line; note that setting --mode=ALL would be incorrect if 
-			# supportMultipleModesPerRun=false but that's a legacy options so we raise an exception later if this happened)
-			args = ['--purge', '--record', '-j0', '--type=auto', '--mode=ALL',  '-XcodeCoverage']+args
+			# by CI writers and/or the command line)
+			# Also we don't set --modes=ALL here to allow for it to be overridden explicitly if needed
+			args = ['--purge', '--record', '-j0', '--type=auto', '--exclude=manual', '-XcodeCoverage']+args
 			printLogsDefault = PrintLogs.FAILURES
 
 		try:
@@ -210,11 +216,10 @@ e.g.
 
 		log.debug('PySys arguments: tests=%s options=%s', self.arguments, optlist)
 
-		EXPR1 = re.compile("^[\w\.]*=.*$")
-		EXPR2 = re.compile("^[\w\.]*$")
+		EXPR1 = re.compile(r"^[\w\.]*=.*$")
+		EXPR2 = re.compile(r"^[\w\.]*$")
 
 		printLogs = None
-		ci = False
 		defaultAbortOnError = None
 
 		logging.getLogger('pysys').setLevel(logging.INFO)
@@ -241,14 +246,9 @@ e.g.
 				verbosity = value
 				if '=' in verbosity:
 					loggername, verbosity = value.split('=')
-					assert not loggername.startswith('pysys.'), 'The "pysys." prefix is assumed and should not be explicitly specified'
-					if loggername.startswith('python:'):
+					if loggername.startswith('python:'): # this is weird but was documented, so leave it in place just in case someone is using it
 						loggername = loggername[len('python:'):]
 						assert not loggername.startswith('pysys'), 'Cannot use python: with pysys.*' # would produce a duplicate log handler
-						# in the interests of performance and simplicity we normally only add the pysys.* category 
-						logging.getLogger(loggername).addHandler(pysys.internal.initlogging.pysysLogHandler)
-					else:
-						loggername = 'pysys.'+loggername
 				else:
 					loggername = None
 				
@@ -269,11 +269,15 @@ e.g.
 					# not necessarily downgrade the root level (would make run.log less useful and break 
 					# some PrintLogs behaviour)
 					stdoutHandler.setLevel(verbosity)
-					if verbosity == logging.DEBUG: logging.getLogger('pysys').setLevel(logging.DEBUG)
+					if verbosity == logging.DEBUG: 
+						logging.getLogger('pysys').setLevel(logging.DEBUG)
+						logging.getLogger().setLevel(logging.DEBUG)
 				else:
 					# for specific level setting we need the opposite - only change stdoutHandler if we're 
 					# turning up the logging (since otherwise it wouldn't be seen) but also change the specified level
+					# make the user of "pysys." prefix optional
 					logging.getLogger(loggername).setLevel(verbosity)
+					logging.getLogger('pysys.'+loggername).setLevel(verbosity)
 				
 			elif option in ("-a", "--type"):
 				self.type = value
@@ -309,14 +313,9 @@ e.g.
 				self.modeexclude = self.modeexclude+[x.strip() for x in value.split(',')]
 
 			elif option in ["-n", "-j", "--threads"]:
-				N_CPUS = multiprocessing.cpu_count()
 				if value.lower()=='auto': value='0'
-				if value.lower().startswith('x'):
-					self.threads = max(1, int(float(value[1:])*N_CPUS))
-				else:
-					self.threads = int(value)
-					if self.threads <= 0: self.threads = int(os.getenv('PYSYS_DEFAULT_THREADS', N_CPUS))
-
+				self.threads = value
+				
 			elif option in ("-b", "--abort"):
 				defaultAbortOnError = str(value.lower()=='true')
 				
@@ -346,18 +345,30 @@ e.g.
 				
 				self.userOptions[key] = value
 			
-			elif option in ("-y", "--validateOnly"):
+			elif option in ("-y", "--validateOnly", "--vo"):
 				self.userOptions['validateOnly'] = True
 
 			elif option in ("-G", "--grep"):
 				self.grep = value
 
+			elif option in ("-s", "--sort"):
+				self.sort = value
+				if value not in ['random']:
+					print("The only supported sort type for pysys run is currently 'random'")
+					sys.exit(10)
+				
 			else:
 				print("Unknown option: %s"%option)
 				sys.exit(1)
 
+		if ci and not self.modeinclude: # only set this if there is no explicit --mode arguments
+			self.modeinclude = ['ALL']
+
 		# log this once we've got the log levels setup
 		log.debug('PySys is installed at: %s; python from %s', os.path.dirname(pysys.__file__), sys.executable)
+		log.debug('Working dir=%s, args=%s', os.getcwd(), " ".join(sys.argv))
+		log.debug('Main environment vars: %s', '\n  '.join(f'{envvar}={os.environ[envvar]}' for envvar in sorted(os.environ.keys()) 
+			if envvar.endswith('PATH') or envvar.startswith(('PYTHON', 'PYSYS'))))
 
 		# retained for compatibility, but PYSYS_DEFAULT_ARGS is a better way to achieve the same thing
 		if os.getenv('PYSYS_PROGRESS','').lower()=='true': self.progress = True
@@ -368,6 +379,7 @@ e.g.
 			'progressWritersEnabled':self.progress,
 			'printLogs': printLogs,
 			'printLogsDefault': printLogsDefault, # to use if not provided by a CI writer or cmdline
+			'sort': self.sort
 		}
 		
 		# load project AFTER we've parsed the arguments, which opens the possibility of using cmd line config in 
@@ -375,8 +387,6 @@ e.g.
 		Project.findAndLoadProject(outdir=self.outsubdir)
 		
 		if defaultAbortOnError is not None: setattr(Project.getInstance(), 'defaultAbortOnError', defaultAbortOnError)
-		if '--ci' in args and not Project.getInstance().getProperty('supportMultipleModesPerRun', True): 
-			raise UserError('Cannot use --ci option with a legacy supportMultipleModesPerRun=false project')
 		
 		descriptors = createDescriptors(self.arguments, self.type, self.includes, self.excludes, self.trace, self.workingDir, 
 			modeincludes=self.modeinclude, modeexcludes=self.modeexclude, expandmodes=True)
@@ -389,8 +399,26 @@ e.g.
 			regex = re.compile(self.grep, flags=re.IGNORECASE)
 			descriptors = [d for d in descriptors if (regex.search(d.id) or regex.search(d.title))]
 		
-		runnermode = self.modeinclude[0] if len(self.modeinclude)==1 else None # used when supportMultipleModesPerRun=False
-		return self.record, self.purge, self.cycle, runnermode, self.threads, self.outsubdir, descriptors, self.userOptions
+		return self.record, self.purge, self.cycle, None, self.threads, self.outsubdir, descriptors, self.userOptions
+
+def decideWorkerThreads(threads: str):
+	N_CPUS = pysys.utils.osutils._initUsableCPUCount() # may be fractional
+
+	# Following the example of Python's ThreadPoolExecutor, put an upper bound on the number of CPUs PySys will use 
+	# to avoid taking over wide machines pointlessly, given the GIL will limit how much can really be used
+	maxThreads = Project.getInstance().getProperty('pysysMaxWorkerThreads', 32)
+	
+	if threads.lower().startswith('x'):
+		threads = max(1, int(float(threads[1:])*N_CPUS))
+		if threads>maxThreads: threads = maxThreads
+	else:
+		threads = int(threads)
+		if threads <= 0: # = auto mode
+			threads = int(os.getenv('PYSYS_DEFAULT_THREADS', N_CPUS))
+			if threads>maxThreads: threads = maxThreads
+	
+	return threads
+
 
 def runTest(args):
 	try:
@@ -399,10 +427,13 @@ def runTest(args):
 		
 		cls = Project.getInstance().runnerClassname.split('.')
 		module = importlib.import_module('.'.join(cls[:-1]))
+		
+		# calculate the threads at this point AFTER runner has been imported (allowing monkey-patching in custom runner if needed)
+		args = list(args)
+		args[4] = decideWorkerThreads(args[4])
+		
 		runner = getattr(module, cls[-1])(*args)
 		runner.start()
-		if not Project.getInstance().getProperty('supportMultipleModesPerRun', True):
-			sys.stderr.write('\nWarning: the project property supportMultipleModesPerRun=false is deprecated and will be removed soon so please update your tests to use the modern supportMultipleModesPerRun=true behaviour instead.\n')
 	
 		for cycledict in runner.results.values():
 			for outcome in OUTCOMES:
@@ -411,4 +442,6 @@ def runTest(args):
 	except Exception as e:
 		sys.stderr.write('\nPYSYS FATAL ERROR: %s\n' % e)
 		if not isinstance(e, UserError): traceback.print_exc()
-		sys.exit(10)
+		sys.exit({
+			'The supplied options did not result in the selection of any tests':9, # special error code for specific things users might treat differently
+			}.get(str(e), 10)) # by default return 10

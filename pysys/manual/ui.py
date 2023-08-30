@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-# PySys System Test Framework, Copyright (C) 2006-2020 M.B. Grieve
+# PySys System Test Framework, Copyright (C) 2006-2022 M.B. Grieve
 
 # This library is free software; you can redistribute it and/or
 # modify it under the terms of the GNU Lesser General Public
@@ -23,14 +23,11 @@ The Manual Test User Interface used by `pysys.basetest.BaseTest.startManualTeste
 
 import sys
 try:
-	if sys.version_info[0] == 2:
-		from Tkinter import *
-	else:
-		from tkinter import *
+	from tkinter import *
 except Exception:
 	pass 
 
-from pysys.xml.manual import *
+from pysys.config.manual import *
 
 
 class ManualTester(object):  # pragma: no cover

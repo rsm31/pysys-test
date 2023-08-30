@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-# PySys System Test Framework, Copyright (C) 2006-2020 M.B. Grieve
+# PySys System Test Framework, Copyright (C) 2006-2022 M.B. Grieve
 
 # This library is free software; you can redistribute it and/or
 # modify it under the terms of the GNU Lesser General Public
@@ -18,8 +18,8 @@
 """
 Dynamic TCP port allocation. 
 
-This is used by the `pysys.process.user.ProcessUser` class (and its subclasses e.g. BaseTest) which should 
-usually be used to access this functionality. 
+This is used by `pysys.basetest.BaseTest.getNextAvailableTCPPort` which should usually be used to access this 
+functionality. 
 """
 
 import collections, random, subprocess, sys
@@ -37,6 +37,21 @@ from pysys.utils.fileutils import openfile
 tcpServerPortPool = None
 
 _log = logging.getLogger('pysys.allocport')
+
+excludedTCPPorts = {
+	#	nb we don't bother listing ports lower than 1024 since they wouldn't be selected anyway
+	1719, 1720, 1723, 2049, 3659, 4045, 5060, 5061, 6000, 6566, 6665, 6666, 6667, 6668, 6669, 6697, 10080,
+}
+"""
+A set containing TCP server ports which will never be allocated by `pysys.basetest.BaseTest.getNextAvailableTCPPort` 
+(or `TCPPortOwner`). 
+
+By default this contains blocked ports that some web browsers do not permit connections 
+to for security reasons, which would therefore cause browser-driven tests to fail. 
+
+If desired you can modify this set from a custom `pysys.baserunner.BaseRunner` module (before the ``BaseRunner`` 
+constructor is executed). 
+"""
 
 def getEphemeralTCPPortRange():
 	"""Returns the minimum and maximum TCP ports this operating system uses to allocate
@@ -90,10 +105,7 @@ def getEphemeralTCPPortRange():
 
 			ephemeral_low = 1025
 			ephemeral_high = 5000 # The default
-			if sys.version_info[0] == 2:
-				import _winreg as winreg
-			else:
-				import winreg
+			import winreg
 			with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r'SYSTEM\CurrentControlSet\Services\Tcpip\Parameters') as h:
 				try:
 					ephemeral_high = winreg.QueryValueEx(h, 'MaxUserPort')[0]
@@ -123,8 +135,8 @@ def getServerTCPPorts():
 	pool of available ports that can be allocated by `pysys.basetest.BaseTest.getNextAvailableTCPPort()`. 
 
 	PySys treats all ports from 1024-65536 as server ports except for the client-side ephemeral/dynamic port range 
-	as determined by `getEphemeralTCPPortRange()`. Alternatively, the set of server ports can be overridden by the 
-	following environment variables:
+	as determined by `getEphemeralTCPPortRange()` and specific ports in the ``excludedTCPPorts`` set. 
+	Alternatively, the set of server ports can be overridden by the following environment variables:
 	
 	  - ``PYSYS_PORTS=minport-maxport,port,...`` PySys will use the specified ports and/or port ranges (inclusive) 
 	    allocating server ports.  
@@ -136,7 +148,7 @@ def getServerTCPPorts():
 	See `logPortAllocationStats()` for information about how to log statistics showing how many server ports your tests 
 	are using. 
 
-	:return: A list or set of all the server ports that can be used, e.g. [1024, 1025, ...]. 
+	:return: A list of all the server ports that can be used, e.g. [1024, 1025, ...]. 
 	:raises Exception: If the port range cannot be determined, which will prevent PySys from running any tests. 
 	"""
 	if os.getenv('PYSYS_PORTS', None):
@@ -154,19 +166,21 @@ def getServerTCPPorts():
 			fallback_low, fallback_high = (1024, 49152-1)
 			_log.warning('PySys has detected that only %d ports are remaining for starting servers, after removing the %d-%d ephemeral/dynamic port range on this machine (%s). To ensure enough ports are available, PySys is falling back to using the server port range %d-%d, however this may result in clashes between server ports and ephemeral ports so it is recommended to change your TCP configuration on this machine to provide more balance between the number of ephemeral vs server ports. ', len(ports), ephemeral_low, ephemeral_high, platform.platform(), fallback_low, fallback_high)
 			ports = list(range(fallback_low, fallback_high+1))
-		return ports
+		specs = None
+	if specs is not None:
+		ports = set()
+		for x in specs:
+			x = x.strip()
+			if len(x)==0: continue
+			
+			if '-' in x:
+				envrange = x.split('-')
+				for p in range(int(envrange[0].strip()), int(envrange[1].strip())+1):
+					ports.add(p)
+			else:
+				ports.add(int(x.strip()))
 
-	ports = set()
-	for x in specs:
-		x = x.strip()
-		if len(x)==0: continue
-		
-		if '-' in x:
-			envrange = x.split('-')
-			for p in range(int(envrange[0].strip()), int(envrange[1].strip())+1):
-				ports.add(p)
-		else:
-			ports.add(int(x.strip()))
+	ports = [p for p in ports if p not in excludedTCPPorts]
 	return ports
 
 
@@ -184,7 +198,7 @@ def initializePortPool():
 	global tcpServerPortPool, __totalServerPorts
 	assert tcpServerPortPool is None, 'Cannot call initializePortPool() more than once per process'
 
-	tcpServerPortPool = list(getServerTCPPorts())
+	tcpServerPortPool = getServerTCPPorts()
 	
 	__totalServerPorts = len(tcpServerPortPool)
 
@@ -242,9 +256,9 @@ __totalAllocatedPorts = 0
 def allocateTCPPort(hosts=['', 'localhost'], socketAddressFamily=socket.AF_INET, type=socket.SOCK_STREAM, proto=0):
 	# nb: expose socket type and protocol number here but not higher up the stack just in case someone needs them, but 
 	# not very likely
-	t = time.time()
+	t = time.monotonic()
 	haslogged = False
-	while time.time()-t < TIMEOUTS['WaitForAvailableTCPPort']:
+	while time.monotonic()-t < TIMEOUTS['WaitForAvailableTCPPort']:
 		
 		# in case we've allocated all the available ports, loop 
 		# until another test terminates and free up some ports
@@ -259,13 +273,15 @@ def allocateTCPPort(hosts=['', 'localhost'], socketAddressFamily=socket.AF_INET,
 				haslogged = True
 			continue
 		
+		if port in excludedTCPPorts: continue # in case excludedTCPPorts was added to after the pool was initialized; no point returning this to the pool
+		
 		if any(portIsInUse(port, socketAddressFamily=socketAddressFamily, type=type, proto=proto, host=host) for host in hosts):
 			# Toss the port back at the end of the queue
 			tcpServerPortPool.append(port)
 			time.sleep(0.5) # avoid spinning
 		else:
 			if haslogged:
-				_log.info('   successfully allocated TCP port %d after %0.1fs', port, time.time()-t)
+				_log.info('   successfully allocated TCP port %d after %0.1fs', port, time.monotonic()-t)
 			global __totalAllocatedPorts, __peakAllocatedPorts
 			__totalAllocatedPorts += 1 # sufficiently thread-safe for statistics reporting due to GIL (minor errors tolerated)
 			__peakAllocatedPorts = max(__peakAllocatedPorts, __totalServerPorts-len(tcpServerPortPool))
@@ -284,11 +300,12 @@ def logPortAllocationStats(logger=logging.getLogger('pysys.portAllocationStats')
 		pysys run -v portAllocationStats=DEBUG
 	
 	"""
-	logger.debug('TCP server port allocation stats: peakAllocatedPorts=%s, portPoolSize=%s, lifetimeTotalAllocatedPorts=%s',
-		__peakAllocatedPorts, __totalServerPorts, __totalAllocatedPorts)
+	logger.debug('TCP server port allocation stats: portPoolSize=%s, peakAllocatedPorts=%s, lifetimeTotalAllocatedPorts=%s',
+		__totalServerPorts, __peakAllocatedPorts, __totalAllocatedPorts)
+		
 	return { # undocumented for now, but might be useful for hacking around
-		'peakAllocatedPorts': __peakAllocatedPorts,
 		'totalServerPorts': __totalServerPorts,
+		'peakAllocatedPorts': __peakAllocatedPorts,
 		'lifetimeTotalAllocatedPorts': __totalAllocatedPorts,
 	}
 

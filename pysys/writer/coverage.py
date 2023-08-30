@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-# PySys System Test Framework, Copyright (C) 2006-2020 M.B. Grieve
+# PySys System Test Framework, Copyright (C) 2006-2022 M.B. Grieve
 
 # This library is free software; you can redistribute it and/or
 # modify it under the terms of the GNU Lesser General Public
@@ -47,14 +47,14 @@ class PythonCoverageWriter(CollectTestOutputWriter):
 	``destArchive`` property (see `CollectTestOutputWriter`), and published as "PythonCoverageArchive". 
 
 	Note that to maintain compatibility with pre-1.6.0 projects, a PythonCoverageWriter instance will be _automatically_ 
-	added to the project if the ``pythonCoverageDirA`` project property is set and none is explicitly configured; but 
+	added to the project if the ``pythonCoverageDir`` project property is set and none is explicitly configured; but 
 	the automatic addition is deprecated so you should explicity add this writer to your project if you need it. 
 
 	.. versionadded:: 1.6.0
 
 	The following properties can be set in the project configuration for this writer (and see also 
 	`pysys.writer.testoutput.CollectTestOutputWriter` for inherited properties such as ``destArchive`` which produces 
-	a .zip of the destDir):		
+	a .zip of the destDir and ``includeTestIf`` for limiting collection to only unit/smoke tests):		
 	"""
 
 	# override CollectTestOutputWriter property values
@@ -79,7 +79,7 @@ class PythonCoverageWriter(CollectTestOutputWriter):
 	Set this to True to enable measuring coverage for this process (i.e. PySys), rather than only child Python processes. 
 	This is useful for testing PySys plugins. 
 	
-	.. versionadded:: 1.7.0
+	.. versionadded:: 2.0
 	"""
 
 	__selfCoverage = None
@@ -89,7 +89,7 @@ class PythonCoverageWriter(CollectTestOutputWriter):
 			return False
 		try:
 			import coverage
-			assert coverage.__file__ != __file__ or sys.version_info[0] == 2, __file__ # just to make sure we're not getting confused with our own pysys coverage module; ignore for python 2 as can't make it work
+			assert coverage.__file__ != __file__, __file__ # just to make sure we're not getting confused with our own pysys coverage module
 		except ImportError:
 			# don't log higher than debug because this user may just be doing a --ci run with -XcodeCoverage for some 
 			# other reason and may not even be intending to run with Python coverage
@@ -102,9 +102,6 @@ class PythonCoverageWriter(CollectTestOutputWriter):
 		super(PythonCoverageWriter, self).setup(*args, **kwargs)
 		import coverage
 		if self.includeCoverageFromPySysProcess:
-			if sys.version_info[0] == 2: 
-				log.warning('Ignoring includeCoverageFromPySysProcess option - not supported by Python 2')
-				return
 			args = self.getCoverageArgsList()
 			assert len(args)==1 and args[0].startswith('--rcfile='), 'includeCoverageFromPySysProcess can only be used if pythonCoverageArgs is set to "--rcfile=XXXX"'
 			mkdir(self.destDir)
@@ -128,12 +125,12 @@ class PythonCoverageWriter(CollectTestOutputWriter):
 	
 		coverageDestDir = self.destDir
 		assert os.path.isabs(coverageDestDir) # The base class is responsible for absolutizing this config property
-		coverageDestDir = os.path.normpath(fromLongPathSafe(coverageDestDir))
 		if not pathexists(coverageDestDir):
 			log.info('No Python coverage files were generated.')
 			return
 			
-		log.info('Preparing Python coverage report in: %s', coverageDestDir)
+		log.info('Preparing Python coverage report from %d files in: %s', len(os.listdir(coverageDestDir)), os.path.normpath(coverageDestDir))
+		coverageDestDir = os.path.normpath(fromLongPathSafe(coverageDestDir))
 
 		self.runner.startPython(['-m', 'coverage', 'combine'], abortOnError=True, 
 			workingDir=coverageDestDir, stdouterr=coverageDestDir+'/python-coverage-combine', 
@@ -151,6 +148,11 @@ class PythonCoverageWriter(CollectTestOutputWriter):
 			workingDir=coverageDestDir, stdouterr=coverageDestDir+'/python-coverage-html', 
 			disableCoverage=True, onError=lambda process: self.runner.getExprFromFile(process.stdout, '.+', returnNoneIfMissing=True) 
 				or self.runner.logFileContents(process.stderr, maxLines=0))
+		
+		htmlcov = os.path.join(coverageDestDir, 'htmlcov', 'index.html')
+		if os.path.exists(htmlcov):
+			log.info('Python coverage HTML: %s', htmlcov)
+
 
 		# to avoid confusion, remove any zero byte out/err files from the above
 		for p in os.listdir(coverageDestDir):

@@ -1,4 +1,4 @@
-# PySys System Test Framework, Copyright (C) 2006-2020 M.B. Grieve
+# PySys System Test Framework, Copyright (C) 2006-2022 M.B. Grieve
 
 # This library is free software; you can redistribute it and/or
 # modify it under the terms of the GNU Lesser General Public
@@ -28,7 +28,7 @@ from pysys.constants import *
 from pysys.launcher import createDescriptors
 from pysys.exceptions import UserError
 from pysys.utils.fileutils import deletedir
-from pysys.xml.project import Project
+from pysys.config.project import Project
 
 class ConsoleCleanTestHelper(object):
 	def __init__(self, workingDir, name=""):
@@ -99,7 +99,6 @@ class ConsoleCleanTestHelper(object):
 			Project.findAndLoadProject(outdir=self.outsubdir)
 
 			descriptors = createDescriptors(self.arguments, None, [], [], None, self.workingDir, expandmodes=False)
-			supportMultipleModesPerRun = Project.getInstance().getProperty('supportMultipleModesPerRun', True)
 
 			for descriptor in descriptors:
 				if self.all:
@@ -123,7 +122,7 @@ class ConsoleCleanTestHelper(object):
 					if os.path.isabs(self.outsubdir): # must delete only the selected testcase
 						pathToDelete += "/"+descriptor.id
 						
-					if supportMultipleModesPerRun and mode:
+					if mode:
 						pathToDelete += '~'+mode
 
 					if os.path.exists(pathToDelete):

@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-# PySys System Test Framework, Copyright (C) 2006-2020 M.B. Grieve
+# PySys System Test Framework, Copyright (C) 2006-2022 M.B. Grieve
 
 # This library is free software; you can redistribute it and/or
 # modify it under the terms of the GNU Lesser General Public
@@ -17,6 +17,8 @@
 
 """
 Unpacking one or more compressed files. 
+
+Deprecated - use `pysys.basetest.BaseTest.unpackArchive` instead. 
 """
 
 from __future__ import print_function
@@ -49,6 +51,8 @@ def unzipall(path, binary=False):
 
 def unzip(zfilename, replace=False, binary=False):
 	"""Unzip a .gz archive and write the contents to disk.
+	
+	Deprecated - replace ``unzip(gzfilename, binary=True)`` with ``self.unpackArchive(gzfilename, gzfilename[:-3])``
 	
 	The method will unpack a file of the form C{file.data.gz} to C{file.data}, removing the 
 	archive file in the process if the C{replace} input parameter is set to true. 

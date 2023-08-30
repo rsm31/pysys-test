@@ -1,12 +1,12 @@
 import os, sys
 import warnings
 
-import pysys
+import pysys, pysys.process, pysys.process.user
 from pysys.constants import IS_WINDOWS, FAILED
 from pysys.utils.filecopy import filecopy
-from pysys.xml.project import createProjectConfig
+from pysys.config.project import createProjectConfig
 
-def runPySys(processowner, stdouterr, args, ignoreExitStatus=False, abortOnError=True, environs=None, projectfile=None, defaultproject=False, expectedExitStatus='==0', **kwargs):
+def runPySys(processowner: pysys.process.user.ProcessUser, stdouterr, args, ignoreExitStatus=False, abortOnError=True, environs=None, projectfile=None, defaultproject=False, expectedExitStatus='==0', **kwargs):
 	"""
 	Executes pysys from within pysys. Used only by internal pysys testcases. 
 	"""
@@ -17,6 +17,9 @@ def runPySys(processowner, stdouterr, args, ignoreExitStatus=False, abortOnError
 		args = [os.path.abspath(sys.argv[0])]+args
 	else:
 		args = ['-m', 'pysys']+args
+
+	if os.getenv('PYSYS_PPROFILE','').lower()=='true':
+		args = ['-m', 'pprofile']+args
 
 	# allow controlling lang from the parent e.g. via Travis, if not explicitly set
 	if not IS_WINDOWS and 'LANG' not in (environs or {}) and 'LANG' in os.environ: 
@@ -30,8 +33,13 @@ def runPySys(processowner, stdouterr, args, ignoreExitStatus=False, abortOnError
 
 	environs = processowner.createEnvirons(overrides=environs, command=sys.executable)
 
+	environs.setdefault("PYSYS_USERNAME", "pysystestuser")
+
 	# Error on warnings, to keep everything clean
 	environs.setdefault("PYTHONWARNINGS", "error")
+	environs.setdefault("PYTHONDONTWRITEBYTECODE", "true")
+
+	environs.setdefault('TERM_PROGRAM', '') # not vscode, to avoid changing our test behaviour
 
 	if defaultproject:
 		createProjectConfig(os.path.join(processowner.output, kwargs.get('workingDir', '.')))
@@ -40,7 +48,7 @@ def runPySys(processowner, stdouterr, args, ignoreExitStatus=False, abortOnError
 		environs['PYSYS_PROJECTFILE'] = os.path.join(processowner.input, projectfile)
 	else:
 		# ensure there's a project file else it'll use the parent one and potentially compete to overwrite the junit reports etc
-		if 'makeproject' not in args:
+		if 'makeproject' not in args and 'make' not in args:
 			assert os.path.exists(os.path.join(processowner.output, kwargs.get('workingDir', processowner.output), 'pysysproject.xml')) or os.path.exists(processowner.output+'/pysysproject.xml')
 	
 	# since we might be running this from not an installation
@@ -57,12 +65,20 @@ def runPySys(processowner, stdouterr, args, ignoreExitStatus=False, abortOnError
 	return result
 
 class PySysTestPlugin:
-	def setup(self, testObj):
+	def __init__(self, testObj=None):
+		self.testObj = testObj # =None if loaded via test-plugin mechanism
+	def setup(self, testObj): # only called it loaded via test-plugin mechanism
 		self.testObj = testObj
 	
-	def pysys(self, stdouterr, *args, **kwargs):
-		runPySys(self.testObj, stdouterr, *args, **kwargs)
+	def pysys(self, stdouterr, *args, **kwargs) -> pysys.process.Process:
+		""" See `runPySys` for details. """
+		return runPySys(self.testObj, stdouterr, *args, **kwargs)
 
+class PySysTestHelper:
+	def __init__(self, *args, **kwargs):
+		super().__init__(*args, **kwargs)
+		self.pysys = PySysTestPlugin(self)
+	
 class PySysRunnerPlugin:
 	def setup(self, runner):
 		if not sys.warnoptions:

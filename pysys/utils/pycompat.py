@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-# PySys System Test Framework, Copyright (C) 2006-2018 M.B.Grieve
+# PySys System Test Framework, Copyright (C) 2006-2022 M.B.Grieve
 
 # This library is free software; you can redistribute it and/or
 # modify it under the terms of the GNU Lesser General Public
@@ -18,49 +18,46 @@
 
 
 """
-Compatibility utilities to allow PySys to support both Python 2 and 3. 
+Compatibility utilities for older Python versions. 
 
+This module is now deprecated as all functionality can be provided by the Python standard library. 
+
+Instead of ``quotestring`` use `pysys.utils.misc.quoteString`. 
 """
 
 import sys, os, io, locale
+import copy
 import logging
 __log = logging.getLogger('pysys.pycompat')
 
 PY2 = sys.version_info[0] == 2
 
-string_types = (basestring,) if PY2 else (str,)
+string_types = (str,)
 
-binary_type = str if PY2 else bytes
+binary_type = bytes
 
 def isstring(s): 
 	""" Returns True if the specified object is a python string. 
-	On Python 2 this could be a unicode character string or a byte str, 
-	on python 3 this must be a character str. 
+	
+	Deprecated - use ``isinstance(s, str)`` instead.
+	
 	"""
-	return isinstance(s, string_types)
+	return isinstance(s, str)
+
+from pysys.utils.misc import quoteString as __quotestring # for pre-2.0 compatibility
 
 def quotestring(s):
 	""" Adds double quotation marks around the specified character or byte string, 
 	and additional escaping only if needed to make the meaning clear, but trying to 
 	avoid double-slashes unless actually needed since it makes paths harder to read
 	
-	If a byte string is provided and this is Python 3+ then the 
+	If a byte string is provided then the 
 	``repr()`` representation is used instead. 
+	
+	Deprecated - use `pysys.utils.misc.quoteString` instead. 
+	
 	"""
-	# this function exists primarily to provide the same quoting behaviour 
-	# for str/unicode in Python 2 and str in Python 3, but avoiding 
-	# the confusing "b'valuehere'" representation that "%s" would 
-	# produce for python 3 bytes objects
-	r = repr(s)
-	if not isstring(s): return r
-	
-	if '\\' in r.replace('\\\\',''): # if it contains escape sequences like \n to \" we'd better just use repr so it's unambiguous
-		return r
-	
-	# repr uses single quotes, so using double quotes is a good way to make it distinguishable 
-	# (the other option would be using r'...' since essentially this is like a Python raw string
-
-	return '"%s"'%s
+	return __quotestring(s)
 	
 def openfile(path, mode='r', encoding=None, errors=None, **kwargs):
 	"""
@@ -69,15 +66,11 @@ def openfile(path, mode='r', encoding=None, errors=None, **kwargs):
 	explicitly specified, in which case a file stream 
 	yielding (unicode) character strings is always returned. 
 	
-	Specifically:
-	
-	On Python 3 this method returns a file stream yielding character strings 
+	This method returns a file stream yielding character strings 
 	unless a binary mode was specified in which case a stream yielding 
 	bytes is returned. 
 	
-	On Python 2 this method returns a file stream yielding unicode 
-	character strings only if an encoding was explicitly specified; 
-	otherwise it returns a file stream yielding "str" bytes objects. 
+	Deprecated - use ``io.open(pysys.utils.fileutils.toLongPathSafe(path), ...)`` instead. 
 	
 	:param path: The path to open; must be an absolute path. 
 		Even on Windows this path can be long (e.g. more than the usual 256 
@@ -92,8 +85,7 @@ def openfile(path, mode='r', encoding=None, errors=None, **kwargs):
 	
 	:param errors: Optional string that specifies how encoding/decoding errors 
 		are handled, such as 'strict', 'ignore', 'replace'; see documentation of 
-		io module for more details. The value of this attribute is ignored 
-		if using the python 2 open() built-in with bytes mode that does not support it. 
+		io module for more details. 
 	
 	:param kwargs: Any additional args to be passed to open() or io.open(). 
 	
@@ -111,30 +103,24 @@ def openfile(path, mode='r', encoding=None, errors=None, **kwargs):
 	from pysys.utils.fileutils import toLongPathSafe # import here to avoid circular dependency
 	path = toLongPathSafe(path, onlyIfNeeded=True)
 	
-	if encoding or (not PY2):
-		if encoding: assert 'b' not in mode, 'cannot open file %s with binary mode %s as an encoding was specified'%(path, mode)
-		return io.open(path, mode=mode, encoding=encoding, errors=errors, **kwargs)
-	return open(path, mode=mode, **kwargs)
+	if encoding: assert 'b' not in mode, 'cannot open file %s with binary mode %s as an encoding was specified'%(path, mode)
+	return io.open(path, mode=mode, encoding=encoding, errors=errors, **kwargs)
 
-if PY2:
-	Enum = object
-	"""In Python 2 an enumeration can be simulated by just assigning 
-	constant values with a unique value (perhaps a string) as 
-	statics in a simple object, e.g. ::
-	
-		class MyEnum(Enum):
-			OPTION1 = 'MyEnum.OPTION1'
-			OPTION2 = 'MyEnum.OPTION2'
-			
-		val = getattr(MyEnum, 'option1'.upper(), None)
-		if val is None: raise Exception('Bad option: "%s"'%...)
-	"""
-	
-	def makeReadOnlyDict(input): return input
-	# We can just make do without the additional safety in Python2
+from enum import Enum
 
-else:
-	from enum import Enum
+# Rather than types.MappingProxyType, subclass dict so it's copyable
+class makeReadOnlyDict(dict):
+		def __readonly__(self, *args, **kwargs):
+				raise RuntimeError("Cannot modify read-only dict %r"%self)
+		__setitem__ = __readonly__
+		__delitem__ = __readonly__
+		pop = __readonly__
+		popitem = __readonly__
+		clear = __readonly__
+		update = __readonly__
+		setdefault = __readonly__
+		del __readonly__
+		
+		def __copy__(self): return dict(self)
+		def __deepcopy__(self, memo): return copy.deepcopy(dict(self))
 
-	from types import MappingProxyType as makeReadOnlyDict
-	# May replace this with frozenmap once available

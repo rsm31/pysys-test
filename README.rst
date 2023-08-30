@@ -20,35 +20,36 @@ Key features include:
   starting, orchestration, and cleanup, for both Windows and Unix-based 
   systems. Includes common operations such as:
 
-   * dynamically picking a free TCP/IP port, 
-   * waiting until a server is running on a specified port,
-   * waiting until a file contains a specified message, 
-   * powerful primitives for pre-processing text files (e.g. configuration input files, or output logs)
-   * aborting early with a clear failure messages if an error is detected in a log file
+  * dynamically picking a free TCP/IP port, 
+  * waiting until a server is running on a specified port,
+  * waiting until a file contains a specified message, 
+  * powerful primitives for pre-processing text files (e.g. configuration input files, or output logs)
+  * aborting early with a clear failure messages if an error is detected in a log file
 
 - Support for executing tests in parallel to significantly speed up execution 
   time, with a flexible mechanism for controlling execution order.
 - Ability to cycle a test many times (and in parallel) to reproduce rare race 
   conditions. 
 - Support for executing the same test in several modes during your test 
-  run (for example against different web browsers, databases, etc). 
-- A process memory monitoring framework to check for memory leaks when soak 
-  testing your application.
+  run (for example against different web browsers, databases, or for writing 
+  parameterized tests). Python expressions give the power to easily create 
+  complex and dynamic lists of modes that combine multi-dimensional sets of parameters. 
 - A performance monitoring framework for recording and aggregating latency, 
   throughput and other performance metrics.
-
-- A pluggable "writers" framework for recording test outcomes in any format, 
-  including a standard JUnit-compatible XML results writer and output archiver 
-  in the box, and support for running tests under CI providers such as 
-  GitHub(R) Actions and Travis CI(R).
+- A process memory monitoring framework to monitor memory usage when soak 
+  testing your application.
+- A pluggable "writers" framework for recording test outcomes in any format. Includes 
+  a test output archiver, a writer for the ubiquitous JUnit/Ant(TM) XML file format, 
+  and built-in support for running tests 
+  under CI providers such as GitHub(R) Actions and Travis CI(R).
 - Integrated support for running PyUnit tests and doctests, in case your 
   application is also written in Python.
 - Integrated support for executing manual/interactively driven test cases.
 - Test categorization and selective include/exclude execution, using per-test 
   classification groups.
-- Support for Windows, Linux, macOS and Solaris. 
+- Support for Windows, Linux and macOS. 
 
-PySys was created by Moray Grieve. The current maintainer is Ben Spiller. 
+PySys was created by Moray Grieve. The maintainer is now Ben Spiller. 
 This is a community project so we welcome your contributions, whether 
 enhancement issues or GitHub pull requests! 
 
@@ -76,8 +77,7 @@ Project Links
 Installation
 ============
 
-PySys can be installed into Python 3.9 (recommended), 3.5/3.6/3.7/3.8 or Python 2.7 
-(though note that Python 2.7 itself is out of support from the Python team so is not recommended). 
+PySys can be installed into any Python version from 3.7 to 3.11. 
 
 The best way to install PySys is using the standard ``pip`` installer which 
 downloads and install the binary package for the current PySys 
@@ -128,16 +128,16 @@ After installation, to see the available options to the pysys.py script use::
  
 The script has four main commands: 
 
-  - ``makeproject`` to create your top-level testing project configuration file, 
-  - ``make`` to create individual testcases, 
-  - ``run`` to execute them, and 
-  - ``clean`` to delete testcase output after execution.
+- ``makeproject`` to create your top-level testing project configuration file, 
+- ``make`` to create individual testcases, 
+- ``run`` to execute them, and 
+- ``clean`` to delete testcase output after execution.
 
 For detailed information, see the ``--help`` command line. 
 
 To get started, create a new directory to hold your tests. Then run the 
 ``makeproject`` command from that directory to add a ``pysysproject.xml`` 
-file which will hold default settings your all your tests::
+file which will hold default settings for your tests::
 
 	> mkdir test
 	> cd test
@@ -147,26 +147,26 @@ Then to create your first test, run::
 
 	> pysys.py make MyApplication_001
 
-This will create a ``MyApplication_001`` subdirectory with a ``pysystest.xml`` 
-file holding metadata about the test such as its title, and a ``run.py`` 
-where you can add the logic to ``execute`` your test, and to ``validate`` that 
-the results are as expected. 
+This will create a ``MyApplication_001`` subdirectory with a ``pysystest.py`` file that contains both "descriptor" 
+metadata about the test such as its title, and a Python class where you can add the logic to ``execute`` your test, 
+and to ``validate`` that the results are as expected. 
 
 To run your testcases, simply execute::
 
 	> pysys.py run
 
-To give a flavour for what's possible, here's a system test for checking the behaviour of a server application, which 
-shows of the most common PySys methods:
+To give a flavour for what's possible, here's a system test for checking the behaviour of a server application 
+called MyServer, which shows of the most common PySys methods:
 
 .. code-block:: python
+
+  __pysys_title__   = r""" MyServer startup - basic sanity test (+ demo of PySys basics) """
   
+  __pysys_purpose__ = r""" To demonstrate that MyServer can startup and response to basic requests. 
+    """
+
   class PySysTest(pysys.basetest.BaseTest):
-    """ This is a system test for a server process called MyServer. It checks that the server can be started and 
-      respond to basic requests. """
-    
     def execute(self):
-    
       # Ask PySys to allocate a free TCP port to start the server on (this allows running many tests in 
       # parallel without clashes)
       serverPort = self.getNextAvailableTCPPort()
@@ -218,17 +218,17 @@ shows of the most common PySys methods:
 If you're curious about any of the functionality demonstrated above, there's lots of helpful information on these 
 methods and further examples in the documentation:
 
-	- `pysys.basetest.BaseTest.getNextAvailableTCPPort()`
-	- `pysys.basetest.BaseTest.copy()`
-	- `pysys.basetest.BaseTest.startProcess()` (+ `pysys.basetest.BaseTest.createEnvirons()` and `pysys.basetest.BaseTest.startPython()`)
-	- `pysys.basetest.BaseTest.waitForGrep()`
-	- `pysys.basetest.BaseTest.assertGrep()`
-	- `pysys.basetest.BaseTest.assertThat()`
-	- `pysys.basetest.BaseTest.logFileContents()`
-	- `pysys.mappers`
+- `pysys.basetest.BaseTest.getNextAvailableTCPPort()`
+- `pysys.basetest.BaseTest.copy()`
+- `pysys.basetest.BaseTest.startProcess()` (+ `pysys.basetest.BaseTest.createEnvirons()` and `pysys.basetest.BaseTest.startPython()`)
+- `pysys.basetest.BaseTest.waitForGrep()`
+- `pysys.basetest.BaseTest.assertGrep()`
+- `pysys.basetest.BaseTest.assertThat()`
+- `pysys.basetest.BaseTest.logFileContents()`
+- `pysys.mappers`
 
 Now take a look at `pysys.basetest` to begin exploring more of the powerful functionality 
-PySys provides to help you implement your own ``run.py`` system tests. 
+PySys provides to help you implement your own ``pysystest.py`` system tests. 
 
 The sample projects under https://github.com/pysys-test are a great starting point for learning more about PySys, and 
 for creating your first project. 
@@ -240,7 +240,7 @@ License
 
 PySys System Test Framework
 
-Copyright (C) 2006-2021 M.B. Grieve
+Copyright (C) 2006-2022 M.B. Grieve
 
 This library is free software; you can redistribute it and/or
 modify it under the terms of the GNU Lesser General Public

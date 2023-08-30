@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-# PySys System Test Framework, Copyright (C) 2006-2020 M.B. Grieve
+# PySys System Test Framework, Copyright (C) 2006-2022 M.B. Grieve
 
 # This library is free software; you can redistribute it and/or
 # modify it under the terms of the GNU Lesser General Public
@@ -59,7 +59,7 @@ class WindowsProcessMonitor(BaseProcessMonitor):
 
 	def _getData(self, sample):
 		while True: # loop until we have both a "new" and a "last" value for CPU time
-			if self._stopping.isSet(): raise Exception('Requested to stop')
+			if self._stopping.is_set(): raise Exception('Requested to stop')
 
 			newvalues = {}
 			newvalues['time_ns'] = self._timer_ns()

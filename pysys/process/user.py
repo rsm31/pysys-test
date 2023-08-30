@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-# PySys System Test Framework, Copyright (C) 2006-2020 M.B. Grieve
+# PySys System Test Framework, Copyright (C) 2006-2022 M.B. Grieve
 
 # This library is free software; you can redistribute it and/or
 # modify it under the terms of the GNU Lesser General Public
@@ -25,22 +25,25 @@ import time, collections, inspect, locale, fnmatch, sys
 import threading
 import shutil
 import contextlib
+import importlib
+import concurrent.futures
 
 from pysys import log, process_lock
 from pysys.constants import *
 from pysys.exceptions import *
 from pysys.utils.filegrep import getmatches
 from pysys.utils.logutils import BaseLogFormatter, stripANSIEscapeCodes
-from pysys.xml.project import Project
-from pysys.process.helper import ProcessWrapper
+from pysys.config.project import Project
+from pysys.process.helper import ProcessImpl
 from pysys.utils.allocport import TCPPortOwner
 from pysys.utils.fileutils import mkdir, deletedir, deletefile, pathexists, toLongPathSafe, fromLongPathSafe
 from pysys.utils.pycompat import *
-import pysys.internal.safe_eval
+import pysys.utils.threadutils
+import pysys.utils.safeeval
 from pysys.mappers import applyMappers
 
 if IS_WINDOWS:
-	import win32api, win32con
+	import win32api, win32con, win32event
 else:
 	import fcntl
 
@@ -88,31 +91,57 @@ class ProcessUser(object):
 	:ivar str ~.input: Full path to the directory containing input files (e.g. ``testdir/Input``)
 	:ivar str ~.output: Full path to the directory that output files should be written to (e.g. ``testdir/Output/<platformname>``)
 	:ivar logging.Logger ~.log: The Python ``Logger`` instance that should be used to record progress and status information. 
-	:ivar pysys.xml.project.Project ~.project: A reference to the singleton project instance containing the 
+	:ivar pysys.config.project.Project ~.project: A reference to the singleton project instance containing the 
 		configuration of this PySys test project as defined by ``pysysproject.xml``. 
 		The project can be used to access information such as the project properties which are shared across all tests 
 		(e.g. for hosts and credentials). 
 	:ivar bool ~.disableCoverage: Set to True to disable all code coverage collection for processes 
 		started from this instance. This is automatically set for any tests marked with the "disableCoverage" group 
-		in their pysystest.xml file. 
+		in their ``pysystest.*`` file. 
 			
 		The built-in Python code coverage functionality in L{startPython} checks this 
 		flag. It is recommended that any other languages supporting code coverage 
 		also check the self.disableCoverage flag. 
-	
+
+	:ivar bool ~.isCleanupInProgress: Set to True after the cleanup phase for this object begins. 
+
 	Additional variables that affect only the behaviour of a single method are documented in the associated method. 
 	
 	"""
-	
+
+	isInterruptTerminationInProgress = False
+	""" This static boolean field is set to True if this entire process is in the process of terminating 
+		early due to an interrupt from the keyboard or a signal. 
+
+		.. versionadded:: 2.2
+	"""
+
+	isInterruptTerminationInProgressEvent = win32event.CreateEvent(None, True, False, None) if IS_WINDOWS else None
+	""" A Windows (pywin32) event that will be set/signalled when PySys is requested to terminate, or 
+	``None`` if not supported on this platform. 
+
+	Use this with the pywin32 function ``win32event.WaitForMultipleObjects`` to perform waits 
+	that are aborted if a termination request happens. 
+
+	.. versionadded:: 2.2
+	"""
+
+	isInterruptTerminationInProgressHandle = None
+	""" A file handle that will have bytes available for reading when PySys is requested to terminate, or 
+	``None`` if not supported on this platform. Not available on Windows. 
+
+	Use this with ``select`` to perform waits that are aborted if a termination request happens. 
+	Do not under any circumstances actually read from this handle. 
+
+	.. versionadded:: 2.2
+	"""
+
 	def __init__(self):
-		"""Default constructor.
-		
-		"""
 		self.log = log
 		"""The logger instance that should be used to log from this class. """
 		
 		self.project = Project.getInstance()
-		"""The L{pysys.xml.project.Project} instance containing settings for this PySys project."""
+		"""The `pysys.config.project.Project` instance containing settings for this PySys project."""
 
 		if self.project is None:
 			assert 'doctest' in sys.argv[0], 'Project was not loaded yet' # allow it only during doctest-ing
@@ -143,20 +172,58 @@ class ProcessUser(object):
 		from access by background threads, as needed. 
 		"""
 		
+		self.isCleanupInProgress = False
+
 		# variables affecting a specific method (documented there rather than above)
+
 		self.logFileContentsDefaultExcludes = []
+
+		self.threadPoolMaxWorkers = None # real initialization happens in _initThreadPoolMaxWorkers after runner __init__ has been called, unless a value is overridden here
+
+		self.grepWarnIfLineLongerThan = 10000
+		self.grepTruncateIfLineLongerThan = 0
+		"""
+		Set this to a number of characters to automatically truncate long lines during `waitForGrep` (after all mappers have completed) to the specified length. 
+		This prevents warnings or slow regular expression in large/long log files. 
 		
+		.. versionadded:: 2.2
+		"""
+
+	def _initThreadPoolMaxWorkers(self, pysysThreads):
+		# In theory allow this to be influenced by pysysThreads, but for now we pick a single value since regardless of the number of pysys threads 
+		# a smaller number of threads make the pooling useless for I/O bound operations like HTTP requests (the main use case) and 
+		# a larger (or more machine-scalable) number could cause an explosive overload to the machine or Python GIL if many/all of the PySys workers/tests 
+		# each had their own pool
+		return 6
+		
+	@staticmethod
+	def _setInterruptTerminationInProgress():
+		# undocumented static method for signalling to all ProcessUser objects that PySys is terminating. 
+		if ProcessUser.isInterruptTerminationInProgress is True: return
+
+		# Set this boolean before waking up
+		ProcessUser.isInterruptTerminationInProgress = True
+
+		try:
+			if ProcessUser.isInterruptTerminationInProgressEvent:
+				win32event.SetEvent(ProcessUser.isInterruptTerminationInProgressEvent)
+			if ProcessUser.isInterruptTerminationInProgressHandle:
+				os.write(ProcessUser._isInterruptTerminationInProgressWriteHandle, b'isTerminated')
+					
+		except Exception as ex:
+			log.warning('Failed to signal isInterruptTerminationInProgress event/handle during termination: %r', ex)
+
 	def allocateUniqueStdOutErr(self, processKey):
 		"""Allocate unique filenames of the form ``processKey[.n].out/.err`` 
 		which can be used for the `startProcess` ``stdouterr`` parameter. 
 		
 		The first time this is called it will return names like 
-		``('myprocess.out', 'myprocess.err')``, the second time it will return 
-		``('myprocess.1.out', 'myprocess.1.err')``, then 
-		``('myprocess.2.out', 'myprocess.2.err')`` etc. 
+		``('outdir/myprocess.out', 'outdir/myprocess.err')``, the second time it will return 
+		``('outdir/myprocess.1.out', 'outdir/myprocess.1.err')``, then 
+		``('outdir/myprocess.2.out', 'outdir/myprocess.2.err')`` etc. 
 		
 		:param str processKey: A user-defined identifier that will form the prefix onto which ``[.n].out`` is appended
-		:return: A STDOUTERR_TUPLE named tuple of (stdout, stderr)
+		:return: A STDOUTERR_TUPLE named tuple of (stdout, stderr), where each is an absolute path. 
 		:rtype: STDOUTERR_TUPLE
 
 		"""
@@ -203,7 +270,7 @@ class ProcessUser(object):
 		runTest.py launch executable.
 		
 		If an existing attribute is present on this test class (typically a 
-		static class variable) and it has a type of bool, int or float, then 
+		static class variable) and it has a type of bool, int, float or list, then 
 		any -X options will be automatically converted from string to that type. 
 		This facilitates providing default values for parameters such as 
 		iteration count or timeouts as static class variables with the 
@@ -220,7 +287,7 @@ class ProcessUser(object):
 		on this object (typically as a result of specifying -X on the command 
 		line), or else from the project configuration. 
 		
-		See also `pysys.baserunner.getXArg()` and `pysys.xml.project.Project.getProperty()`. 
+		See also `pysys.baserunner.getXArg()` and `pysys.config.project.Project.getProperty()`. 
 		
 		:param propertyName: The name of a property set on the command line 
 			or project configuration.
@@ -239,7 +306,7 @@ class ProcessUser(object):
 		
 		If PySys was run with the argument ``-XcodeCoverage`` or ``-XpythonCoverage`` then 
 		`startPython` will add the necessary arguments to enable generation of 
-		code coverage. Note that this requried the coverage.py library to be 
+		code coverage. Note that this required the coverage.py library to be 
 		installed. If a project property called `pythonCoverageArgs` exists 
 		then its value will be added as (space-delimited) arguments to the 
 		coverage tool. 
@@ -274,7 +341,7 @@ class ProcessUser(object):
 	def startProcess(self, command, arguments, environs=None, workingDir=None, state=None, 
 			timeout=TIMEOUTS['WaitForProcess'], stdout=None, stderr=None, displayName=None, 
 			abortOnError=None, expectedExitStatus='==0', ignoreExitStatus=None, onError=None, quiet=False, stdouterr=None, 
-			background=False, info={}):
+			background=False, info={}, processFactory=pysys.process.helper.ProcessImpl):
 		"""Start a process running in the foreground or background, and return 
 		the `pysys.process.Process` object.
 		
@@ -302,10 +369,16 @@ class ProcessUser(object):
 
 		When starting a process that will listen on a server socket, use `getNextAvailableTCPPort` 
 		to allocate a free port before calling this method. 
+		
+		Note that although is is possible to use this command to execute OS shell commands, that should only used for 
+		testing of shell scripts - other logic such as file system operations can be executed more easily and robustly 
+		using built-in Python (``os`` module) or PySys (e.g. `BaseTest.copy`) functions. 
 
 		.. versionchanged:: 1.6.0
 			Added onError parameter and default behaviour of logging stderr/out when there's a failure.
 			Added info parameter. 
+		.. versionchanged:: 2.0
+			Added processFactory parameter.
 
 		:param str command: The path to the executable to be launched (should include the full path)
 		:param list[str] arguments: A list of arguments to pass to the command. Any non-string values in the list are 
@@ -369,7 +442,7 @@ class ProcessUser(object):
 			diagnostic information (perhaps using the stdout/err of the process) and/or extracting and returning an 
 			error message from the output, for example: ``onError=lambda process: self.logFileContents(process.stderr, tail=True) or self.logFileContents(process.stdout, tail=True)``.
 
-			If a string value is returned from it will be added to the failure reason, e.g. ``onError=lambda process: self.logFileContents(process.stderr, tail=True) and self.getExprFromFile(process.stderr, 'Error: (.*)')``.
+			If a string value is returned from it will be added to the failure reason, e.g. ``onError=lambda process: self.logFileContents(process.stderr, tail=True) and self.grepOrNone(process.stderr, 'Error: (.*)')``.
 			
 			If no onError function is specified, the default is to log the last few lines of stderr (or if empty, stdout) 
 			when a process fails and abortOnError=True. 
@@ -388,7 +461,20 @@ class ProcessUser(object):
 			a field on the returned Process instance. This is useful for keeping track of things like server port 
 			numbers and log file paths. 
 
-		:return: The process wrapper object.
+		:param callable[kwargs] processFactory: A callable (such as a class constructor) that returns an instance or 
+			subclass of `pysys.process.helper.ProcessImpl`. This can be used either to provide a custom process subclass 
+			with extra features, or to make modifications to the arguments or environment that were specified by the code 
+			that invoked ``startProcess()``. 
+			
+			The signature must consist of a ``**kwargs`` parameter, the members of which will be populated by 
+			the parameters listed in the constructor of `pysys.process.Process`, and can be modified by the factory. For 
+			example::
+			
+				def myProcessFactory(**kwargs):
+					kwargs['arguments'] = kwargs['arguments'][0]+['my_extra_arg']+kwargs['arguments'][1:]
+					return pysys.process.helper.ProcessImpl(**kwargs)
+
+		:return: The process object.
 		:rtype: pysys.process.Process
 
 		"""
@@ -425,9 +511,12 @@ class ProcessUser(object):
 		if not environs: # a truly empty env isn't really usable, so populate it with a minimal default environment instead
 			environs = self.getDefaultEnvirons(command=command)
 		
-		startTime = time.time()
-		process = ProcessWrapper(command, arguments, environs, workingDir, state, timeout, stdout, stderr, 
-			displayName=displayName, expectedExitStatus=expectedExitStatus, info=info)
+		startTime = time.monotonic()
+		
+		# pass everything as a named parameter, which makes life easier for custom factory methods
+		process = processFactory(command=command, arguments=arguments, environs=environs, workingDir=workingDir, 
+			state=state, timeout=timeout, stdout=stdout, stderr=stderr, 
+			displayName=displayName, expectedExitStatus=expectedExitStatus, info=info, owner=self)
 		
 		def handleErrorAndGetOutcomeSuffix(process):
 			if onError: 
@@ -444,12 +533,12 @@ class ProcessUser(object):
 		try:
 			process.start()
 			if state == FOREGROUND:
-				correctExitStatus = pysys.internal.safe_eval.safe_eval('%d %s'%(process.exitStatus, expectedExitStatus), extraNamespace={'self':self})
+				correctExitStatus = pysys.utils.safeeval.safeEval('%d %s'%(process.exitStatus, expectedExitStatus), extraNamespace={'self':self})
 				
 				logmethod = log.info if correctExitStatus else log.warning
 				if quiet: logmethod = log.debug
 				logmethod("Executed %s, exit status %d%s", displayName, process.exitStatus,
-					", duration %d secs" % (time.time()-startTime) if (int(time.time()-startTime)) > 10 else "")
+					", duration %d secs" % (time.monotonic()-startTime) if (int(time.monotonic()-startTime)) > 10 else "")
 				
 				if not ignoreExitStatus and not correctExitStatus:
 					if not stderr and not quiet: log.warning('Process %s has no stdouterr= specified; providing this parameter will allow PySys to capture the process output that shows why it failed', process)
@@ -472,6 +561,11 @@ class ProcessUser(object):
 			(log.warning if not quiet else log.debug)("Process %r timed out after %d seconds, stopping process", process, timeout, extra=BaseLogFormatter.tag(LOG_TIMEOUTS))
 			process.stop()
 			self.addOutcome(TIMEDOUT, '%s timed out after %d seconds%s'%(process, timeout, handleErrorAndGetOutcomeSuffix(process)), printReason=False, abortOnError=abortOnError)
+		except BaseException: 
+			# if we don't do this then we can't cleanup foreground processes interrupted by serious failures like KeyboardInterrupt
+			with self.lock:
+				self.processList.append(process)
+			raise
 		else:
 			with self.lock:
 				self.processList.append(process)
@@ -492,7 +586,7 @@ class ProcessUser(object):
 		This environment contains a minimal PATH/LD_LIBRARY_PATH but does not 
 		attempt to replicate the full set of default environment variables 
 		on each OS, and in particular it does not include any that identify 
-		the the current username or home area. Additional environment 
+		the current username or home area. Additional environment 
 		variables can be added as needed with L{createEnvirons} overrides. If 
 		you don't care about minimizing the risk of your local environment 
 		affecting the test processes you start, just use C{environs=os.environ} 
@@ -568,7 +662,7 @@ class ProcessUser(object):
 
 		# allows setting TEMP to output dir to avoid contamination/filling up of system location; set to blank to do nothing
 		if self.project.getProperty('defaultEnvironsTempDir',''):
-			tempDir = pysys.internal.safe_eval.safe_eval(self.project.defaultEnvironsTempDir, extraNamespace={'self':self})
+			tempDir = pysys.utils.safeeval.safeEval(self.project.defaultEnvironsTempDir, extraNamespace={'self':self})
 			
 			self.mkdir(tempDir)
 			if IS_WINDOWS: # pragma: no cover
@@ -775,21 +869,20 @@ class ProcessUser(object):
 		"""
 		if abortOnError == None: abortOnError = self.defaultAbortOnError
 		try:
-			log.info("Waiting up to %d secs for process %r", timeout, process)
-			t = time.time()
-			process.wait(timeout)
-			if (time.time()-t > 10) or process.exitStatus != 0:
-				log.info("Process %s terminated after %d secs with exit status %d", process, time.time()-t, process.exitStatus)
+			t = time.monotonic()
+			process.wait(timeout) # this will log if it takes more than a few seconds
+			if (time.monotonic()-t > 10) or process.exitStatus != 0:
+				log.info("Process %s terminated after %d secs with exit status %d", process, time.monotonic()-t, process.exitStatus)
 				
 		except ProcessTimeout:
 			if not abortOnError:
-				log.warning("Ignoring timeout waiting for process %r after %d secs (as abortOnError=False)", process, time.time() - t, extra=BaseLogFormatter.tag(LOG_TIMEOUTS))
+				log.warning("Ignoring timeout waiting for process %r after %d secs (as abortOnError=False)", process, time.monotonic() - t, extra=BaseLogFormatter.tag(LOG_TIMEOUTS))
 			else:
 				self.abort(TIMEDOUT, 'Timed out waiting for process %s after %d secs'%(process, timeout), self.__callRecord())
 
 		else:
 			if checkExitStatus:
-				if not pysys.internal.safe_eval.safe_eval('%d %s'%(process.exitStatus, process.expectedExitStatus), extraNamespace={'self':self}):
+				if not pysys.utils.safeeval.safeEval('%d %s'%(process.exitStatus, process.expectedExitStatus), extraNamespace={'self':self}):
 					self.logFileContents(process.stderr, tail=True) or self.logFileContents(process.stdout, tail=True)
 
 					self.addOutcome(BLOCKED, 
@@ -797,6 +890,35 @@ class ProcessUser(object):
 						abortOnError=abortOnError)
 
 		return process.exitStatus
+
+	def pollWait(self, secs):
+		"""
+		Sleeps the current thread for the specified number of seconds, between polling/checking for some condition 
+		to be met. 
+		
+		Unlike `pysys.basetest.BaseTest.wait` (which should be used for larger waits inside tests), pollWait does not 
+		log anything. 
+		
+		Use this method instead of ``time.sleep`` as it provides PySys the chance to abort test execution early when 
+		requested, for example as a result of a keyboard interrupt or signal. 
+		
+		:param float secs: The time to sleep for, typically a few hundred milliseconds. Do not use this method for 
+			really long waits. Cannot be negative. 
+		"""
+		# This implementation is designed to be fast for the common case as it's executed frequently on multiple threads
+
+		if secs > 2: # special (and rare) case: break longer sleeps into smaller chunks in case case someone polls for a long time
+			MAX_SLEEP = 2
+			self.log.debug('pollWait %s secs', secs)
+			while secs > MAX_SLEEP: 
+				if self.isInterruptTerminationInProgress is True and self.isCleanupInProgress is False: raise KeyboardInterrupt()
+				time.sleep(MAX_SLEEP) 
+				secs -= MAX_SLEEP
+		
+		time.sleep(secs) 
+		# Perform an early abort if we're terminating, but not once we enter cleanup code for each test since that 
+		# may need to execute processes
+		if self.isInterruptTerminationInProgress is True and self.isCleanupInProgress is False: raise KeyboardInterrupt()
 
 	def waitForBackgroundProcesses(self, includes=[], excludes=[], timeout=TIMEOUTS['WaitForProcess'], abortOnError=None, checkExitStatus=True):
 		"""Wait for any running background processes to terminate, then check that all background processes 
@@ -825,14 +947,14 @@ class ProcessUser(object):
 		"""
 
 		assert timeout>0, 'timeout must be specified'
-		starttime = time.time()
+		starttime = time.monotonic()
 		includes = includes or self.processList
 		
 		running = [p for p in includes if p.state==BACKGROUND and p.running() and p not in excludes]
 		self.log.info('Waiting up to %d secs for %d background process(es) to complete', timeout, len(running))
 		for p in running:
 			try:
-				thistimeout = starttime+timeout-time.time()
+				thistimeout = starttime+timeout-time.monotonic()
 				if thistimeout <= 0: # we've run out of time
 					raise ProcessTimeout('waitForBackgroundProcesses timed out')
 				if p.running(): 
@@ -849,13 +971,13 @@ class ProcessUser(object):
 			failures = []
 			for process in includes:
 				if process.state!=BACKGROUND or process in excludes: continue
-				if not pysys.internal.safe_eval.safe_eval('%s %s'%(process.exitStatus, process.expectedExitStatus), extraNamespace={'self':self}):
+				if not pysys.utils.safeeval.safeEval('%s %s'%(process.exitStatus, process.expectedExitStatus), extraNamespace={'self':self}):
 					self.logFileContents(process.stderr, tail=True) or self.logFileContents(process.stdout, tail=True)
 
 					failures.append('%s returned exit status %s (expected %s)'%(process, process.exitStatus, process.expectedExitStatus))
 			if failures:
 				self.addOutcome(BLOCKED, ('%d processes failed: '%len(failures) if len(failures)>1 else 'Process ')+'; '.join(failures), abortOnError=abortOnError)
-		(self.log.info if (time.time()-starttime>10) else self.log.debug)('All processes completed, after waiting %d secs'%(time.time()-starttime))
+		(self.log.info if (time.monotonic()-starttime>10) else self.log.debug)('All processes completed, after waiting %d secs'%(time.monotonic()-starttime))
 
 	def writeProcess(self, process, data, addNewLine=True):
 		"""Write binary data to the stdin of a process.
@@ -911,7 +1033,7 @@ class ProcessUser(object):
 
 		s = None
 		try:
-			startTime = time.time()
+			startTime = time.monotonic()
 			while True:
 				if s is None:
 					with process_lock:
@@ -930,8 +1052,8 @@ class ProcessUser(object):
 					s.shutdown(socket.SHUT_RDWR)
 					
 					log.debug("Wait for socket creation completed successfully")
-					if time.time()-startTime>10:
-						log.info("Wait for socket creation completed after %d secs", time.time()-startTime)
+					if time.monotonic()-startTime>10:
+						log.info("Wait for socket creation completed after %d secs", time.monotonic()-startTime)
 					return True
 				except socket.error as ex:
 					if process and not process.running():
@@ -943,9 +1065,9 @@ class ProcessUser(object):
 						return False
 
 					if timeout:
-						currentTime = time.time()
+						currentTime = time.monotonic()
 						if currentTime > startTime + timeout:
-							msg = "Timed out waiting for creation of socket after %d secs: %s"%(time.time()-startTime, ex)
+							msg = "Timed out waiting for creation of socket after %d secs: %s"%(time.monotonic()-startTime, ex)
 							if abortOnError:
 								self.abort(TIMEDOUT, msg, self.__callRecord())
 							else:
@@ -955,7 +1077,7 @@ class ProcessUser(object):
 					# MacOS gives an error if we try to connect to the same socket again after connection refused
 					s.close()
 					s = None
-				time.sleep(0.15)
+				self.pollWait(0.15)
 		finally:
 			if s is not None: s.close()
 
@@ -981,20 +1103,20 @@ class ProcessUser(object):
 		
 		log.debug("Performing wait for file creation: %s", f)
 		
-		startTime = time.time()
+		startTime = time.monotonic()
 		while True:
 			if timeout:
-				currentTime = time.time()
+				currentTime = time.monotonic()
 				if currentTime > startTime + timeout:
 
-					msg = "Timed out waiting for creation of file %s after %d secs" % (file, time.time()-startTime)
+					msg = "Timed out waiting for creation of file %s after %d secs" % (file, time.monotonic()-startTime)
 					if abortOnError:
 						self.abort(TIMEDOUT, msg, self.__callRecord())
 					else:
 						log.warning(msg)
 					break
 					
-			time.sleep(0.01)
+			self.pollWait(0.01)
 			if pathexists(f):
 				log.debug("Wait for '%s' file creation completed successfully", file)
 				return
@@ -1028,11 +1150,11 @@ class ProcessUser(object):
 		
 		Example::
 		
-			self.waitForGrep('myprocess.log', expr='INFO .*Started successfully', encoding='utf-8',
+			self.waitForGrep('myprocess.log', 'INFO .*Started successfully', encoding='utf-8',
 				process=myprocess, errorExpr=[' (ERROR|FATAL) ', 'Failed to start'])
 			
-			self.waitForGrep('myoutput.txt', expr='My message', encoding='utf-8',
-				process=myprocess, errorIf=lambda: self.getExprFromFile('myprocess.log', ' ERROR .*', returnNoneIfMissing=True))
+			self.waitForGrep('myoutput.log', 'My message', encoding='utf-8',
+				process=myprocess, errorIf=lambda: self.grepOrNone('myprocess.err', ' ERROR .*'))
 			
 		Note that waitForGrep fails the test if the expression is not found (unless abortOnError was set to False, 
 		which isn't recommended), so there is no need to add duplication with an 
@@ -1044,7 +1166,14 @@ class ProcessUser(object):
 		example::
 
 			self.assertThat('username == expected', expected='myuser',
-				**self.waitForGrep('myserver.log', expr=r'Successfully authenticated user "(?P<username>[^"]*)"'))
+				**self.waitForGrep('myserver.log', r'Successfully authenticated user "(?P<username>[^"]*)"'))
+
+		If the file is large or contains long lines, it can take a long time for the regular expressions to be 
+		evaluated over each line. It is important to avoid the possibility that data is written to the file faster 
+		than Python can read it, which would lead to the PySys process running very slowly and likely a timeout. 
+		To help detect this situation, this method will log warnings if dangerously long lines are detected. If needed 
+		the threshold for these can be configured by setting the ``self.grepWarnIfLineLongerThan`` field. 
+		If reading from a file that has long lines, consider adding `pysys.mappers.TruncateLongLines` to the mappers list. 
 
 		.. versionadded:: 1.5.1
 
@@ -1072,6 +1201,7 @@ class ProcessUser(object):
 			string if an error is detected which should cause us to abort looking for the grep expression. 
 			This function will be executed frequently (every ``poll`` seconds) so avoid 
 			doing anything time-consuming here unless you set a large polling interval. 
+			See above for an example. 
 			
 			Added in PySys 1.6.0. 
 
@@ -1097,9 +1227,10 @@ class ProcessUser(object):
 			The default value is None which indicates that the decision will be delegated 
 			to the L{getDefaultFileEncoding()} method. 
 
-		:param str detailMessage: An extra string to add to the message logged when waiting to provide extra 
-			information about the wait condition. e.g. ``detailMessage='(downstream message received)'``. 
-			Added in v1.5.1. 
+		:param str detailMessage: An extra string to add to the start of the message logged when waiting to provide extra 
+			information about the wait condition. e.g. ``detailMessage='Wait for server startup: '``. 
+			
+			Added in v1.5.1. From v2.1+ the detail string is added at the beginning not the end. 
 
 		:param int reFlags: Zero or more flags controlling how the behaviour of regular expression matching, 
 			combined together using the ``|`` operator, for example ``reFlags=re.VERBOSE | re.IGNORECASE``. 
@@ -1132,13 +1263,13 @@ class ProcessUser(object):
 		if errorExpr: assert not isstring(errorExpr), 'errorExpr must be a list of strings not a string'
 		
 		matches = []
-		startTime = time.time()
-		msg = "Waiting for {expr} {condition}in {file}{detail}".format(
-			expr=quotestring(expr), # repr performs escaping of embedded quotes, newlines, etc
+		msg = "Waiting for {expr} {condition}in {file}".format(
+			expr=quotestring(expr), # performs escaping of embedded quotes, newlines, etc
 			condition=condition.strip()+' ' if condition!='>=1' else '', # only include if non-default
 			file=os.path.basename(file),
-			detail=' '+detailMessage.strip(' ') if detailMessage else ''
 			)
+		if detailMessage: # prior to v2.1 this was appended at the end but actually it's more useful at the beginning
+			msg = detailMessage.strip(': ')+': '+msg
 
 		log.debug("Performing wait for grep signal %s %s in file %s with ignores %s", expr, condition, f, ignores)
 		
@@ -1156,35 +1287,61 @@ class ProcessUser(object):
 		compiled = re.compile(expr, flags=reFlags)
 		namedGroupsMode = compiled.groupindex and condition.replace(' ','')=='>=1'
 
-		timetaken = time.time()
-		while 1:
-			if pathexists(f):
-				matches = getmatches(f, expr, encoding=encoding, ignores=ignores, flags=reFlags, mappers=mappers)
+		starttime = time.monotonic()
+		lineno = [0] # use an array to hold the line counter so we can update this value inside the function
+		def watchdogMapper(line):		
+			linelen=len(line)-1# minus one for the (likely) newline, to make the numbers round
+			if linelen > 5000:
+				if self.grepTruncateIfLineLongerThan > 0 and linelen > self.grepTruncateIfLineLongerThan:
+					line = line[:self.grepTruncateIfLineLongerThan]+'\n'
+					linelen = len(line)-1
 
-				if pysys.internal.safe_eval.safe_eval("%d %s" % (len(matches), condition), extraNamespace={'self':self}):
-					timetaken = time.time()-timetaken
-					# Old-style/non-verbose behaviour is to log only after complete, 
-					# new/verbose style does the main logging at INFO when starting, and only logs on completion if it took a long time
-					# (this helps people debug tests that sometimes timeout and sometimes "nearly" timeout)
-					if verboseWaitForSignal:
-						(loginfo if timetaken > 30 else log.debug)("   ... found %d matches in %ss", len(matches), int(timetaken))
-					else:
-						# We use the phrase "grep signal" to avoid misleading anyone, whether people used waitForGrep or the older waitForSignal
-						loginfo("Wait for grep signal in %s completed successfully", file)
-					break
-				
-				if errorExpr:
-					for err in errorExpr:
-						errmatches = getmatches(f, err+'.*', encoding=encoding, ignores=ignores, flags=reFlags, mappers=mappers) # add .* to capture entire err msg for a better outcome reason
-						if errmatches:
-							err = errmatches[0].group(0).strip()
-							msg = '%s found while %s'%(quotestring(err), msg)
-							# always report outcome for this case; additionally abort if requested to
-							self.addOutcome(BLOCKED, outcomeReason=msg, abortOnError=abortOnError, callRecord=self.__callRecord())
-							return {} if namedGroupsMode else matches
-				
-			currentTime = time.time()
-			if currentTime > startTime + timeout:
+				if linelen > self.grepWarnIfLineLongerThan:
+					self.log.warning('   very long line of %s characters detected in %s during waitForGrep; be careful as some regular expressions take a very long time to run on long input strings: %s ...', 
+						linelen, file, line[:1000])
+					self.grepWarnIfLineLongerThan *= 5 # increase exponentially (for this test)
+
+			lineno[0] += 1
+			if lineno[0] % 10000 == 0:
+				# periodically check for interruption or timeout; not too often or we might slow down the normal case
+				if self.isInterruptTerminationInProgress is True and self.isCleanupInProgress is False: raise KeyboardInterrupt()
+				if time.monotonic()-starttime > timeout:
+					self.log.debug('waitForGrep watchdog signalled timeout after handling %s lines', lineno[0]) 
+					raise TimeoutError("Timed out during waitForGrep watchdog")
+
+			return line
+		mappers = mappers+[watchdogMapper] # putting the watchdog later allows custom mappers that remove long lines if desired 
+
+		while 1:
+			try:
+				if pathexists(f):
+					matches = getmatches(f, expr, encoding=encoding, ignores=ignores, flags=reFlags, mappers=mappers)
+
+					if pysys.utils.safeeval.safeEval("%d %s" % (len(matches), condition), extraNamespace={'self':self}):
+						timetaken = time.monotonic()-starttime
+						# Old-style/non-verbose behaviour is to log only after complete, 
+						# new/verbose style does the main logging at INFO when starting, and only logs on completion if it took a long time
+						# (this helps people debug tests that sometimes timeout and sometimes "nearly" timeout)
+						if verboseWaitForSignal:
+							(loginfo if timetaken > 30 else log.debug)("   ... found %d matches in %ss", len(matches), int(timetaken))
+						else:
+							# We use the phrase "grep signal" to avoid misleading anyone, whether people used waitForGrep or the older waitForSignal
+							loginfo("Wait for grep signal in %s completed successfully", file)
+						break
+					
+					if errorExpr:
+						for err in errorExpr:
+							errmatches = getmatches(f, err+'.*', encoding=encoding, ignores=ignores, flags=reFlags, mappers=mappers) # add .* to capture entire err msg for a better outcome reason
+							if errmatches:
+								err = errmatches[0].group(0).strip()
+								msg = '%s found while %s'%(quotestring(err), msg[0].lower()+msg[1:])
+								# always report outcome for this case; additionally abort if requested to
+								self.addOutcome(BLOCKED, outcomeReason=msg, abortOnError=abortOnError, callRecord=self.__callRecord())
+								return {} if namedGroupsMode else matches
+				# end of if exists
+				if time.monotonic() > starttime + timeout: raise TimeoutError()
+
+			except TimeoutError: # may come from the above check outside the loop, or from the check every 10k lines within the watchdog
 				msg = "%s timed out after %d secs, %s"%(msg, timeout, 
 					("with %d matches"%len(matches)) if pathexists(f) else 'file does not exist')
 				
@@ -1193,11 +1350,11 @@ class ProcessUser(object):
 				else:
 					log.warning(msg, extra=BaseLogFormatter.tag(LOG_TIMEOUTS))
 				break
-			
+
 			if errorIf is not None:
 				errmsg = errorIf()
 				if errmsg:
-					msg = "%s aborted due to errorIf=%s"%(msg, errmsg)
+					msg = "%s aborted due to errorIf returning %s"%(msg, errmsg)
 					if abortOnError:
 						self.abort(BLOCKED, msg, self.__callRecord())
 					else:
@@ -1212,7 +1369,7 @@ class ProcessUser(object):
 					log.warning(msg)
 				break
 
-			time.sleep(poll)
+			self.pollWait(poll)
 		if namedGroupsMode:
 			return {} if not matches else matches[0].groupdict()
 		return matches
@@ -1224,9 +1381,12 @@ class ProcessUser(object):
 		Cleanup functions should have no arguments, and are invoked in reverse order with the most recently added first (LIFO), and
 		before the automatic termination of any remaining processes associated with this object.
 		
-		e.g.::
+		Typical cleanup tasks are to cleanly shutdown processes (which is sometimes necessary to obtain code coverage 
+		information), and to (attempt to) delete large files/directories created by the test::
 		
 			self.addCleanupFunction(lambda: self.cleanlyShutdownMyProcess(params))
+			self.addCleanupFunction(lambda: self.deleteDir('my-large-dir'), ignoreErrors=True)
+			self.addCleanupFunction(lambda: self.deleteFile('my-large-file.log'), ignoreErrors=True)
 		
 		:param Callable[] fn: The cleanup function. 
 		:param bool ignoreErrors: By default, errors from cleanup functions will result in a test failure; set this to 
@@ -1239,7 +1399,8 @@ class ProcessUser(object):
 
 
 	def cleanup(self):
-		""" Tear down function that frees resources managed by this object. 
+		""" Tear down function that frees resources managed by this object, for example terminating processes it has 
+		started. 
 
 		Should be called exactly once by the owner of this object when is no longer needed. 
 		
@@ -1251,6 +1412,8 @@ class ProcessUser(object):
 			# although we don't yet state this method is thread-safe, make it 
 			# as thread-safe as possible by using swap operations
 			with self.lock:
+				self.isCleanupInProgress = True # lock probably not required for this assignment but might as well
+
 				cleanupfunctions, self.__cleanupFunctions = self.__cleanupFunctions, []
 			if cleanupfunctions:
 				log.info('')
@@ -1268,9 +1431,11 @@ class ProcessUser(object):
 				processes, self.processList = self.processList, []
 			for process in processes:
 				try:
-					if process.running(): process.stop()
+					if process.running(): 
+						log.debug("Stopping process during cleanup: %r", process)
+						process.stop()
 				except Exception as e: # this is pretty unlikely to fail, but we'd like to know if it does
-					log.warning("caught %s: %s", sys.exc_info()[0], sys.exc_info()[1], exc_info=1)
+					log.warning("Caught %s: %s", sys.exc_info()[0].__name__, sys.exc_info()[1], exc_info=1)
 					exceptions.append('Failed to stop process %s: %s'%(process, e))
 			self.processCount = {}
 			
@@ -1306,7 +1471,7 @@ class ProcessUser(object):
 			False for assertions, or the configured `self.defaultAbortOnError` setting (typically True) for 
 			operations that involve waiting. 
 		
-		:param list[str] callRecord: An array of strings of the form path:lineno indicating the call stack that lead 
+		:param list[str] callRecord: An array of strings of the form absolutepath:lineno indicating the call stack that lead 
 			to this outcome. This will be appended to the log output for better test triage.
 		
 		:param bool override: Remove any existing test outcomes when adding this one, ensuring 
@@ -1319,13 +1484,6 @@ class ProcessUser(object):
 			if outcomeReason is None:
 				outcomeReason = ''
 			else: 
-				if PY2 and isinstance(outcomeReason, str): 
-					# The python2 logger is very unhappy about byte str objects containing 
-					# non-ascii characters (specifically it will fail to log them and dump a 
-					# traceback on stderr). Since it's pretty important that assertion 
-					# messages and test outcome reasons don't get swallowed, add a 
-					# workaround for this here. Not a problem in python 3. 
-					outcomeReason = outcomeReason.decode('ascii', errors='replace')
 				outcomeReason = stripANSIEscapeCodes(outcomeReason).strip().replace(u'\t', u' ').replace('\r','').replace('\n', ' ; ')
 			
 			if override: 
@@ -1358,15 +1516,19 @@ class ProcessUser(object):
 						locations = [loc for loc in locations if loc[0].lower().startswith(self.descriptor.testDir.lower()) ]
 						if len(locations) == 0: locations = [parseLocation(loc) for loc in callRecord]
 					loc = locations[0]
-					self.__outcomeLocation = (os.path.normpath(fromLongPathSafe(loc[0])), loc[1])
+					self.__outcomeLocation = (os.path.normpath(os.path.join(self.descriptor.testDir, fromLongPathSafe(loc[0]))), loc[1])
 			if outcome.isFailure() and abortOnError:
 				if callRecord==None: callRecord = self.__callRecord()
 				self.abort(outcome, outcomeReason, callRecord)
 
 			if outcomeReason and printReason:
 				if outcome.isFailure():
-					log.warning(u'%s ... %s %s', outcomeReason, str(outcome).lower(), u'[%s]'%','.join(
-						u'%s:%s'%(os.path.basename(loc[0]), loc[1]) for loc in map(parseLocation,callRecord)) if callRecord!=None else u'',
+					def maybebasename(p):
+						if self.project.getProperty('pysysLogAbsolutePaths', False): return p
+						return os.path.basename(p)
+
+					log.warning(u'%s ... %s %s', outcomeReason, str(outcome).lower(), u'[%s]'%', '.join(
+						u'%s:%s'%(maybebasename(loc[0]), loc[1]) for loc in map(parseLocation,callRecord)) if callRecord!=None else u'',
 							 extra=BaseLogFormatter.tag(str(outcome).lower(),1))
 				else:
 					log.info(u'%s ... %s', outcomeReason, str(outcome).lower(), extra=BaseLogFormatter.tag(str(outcome).lower(),1))
@@ -1438,7 +1600,8 @@ class ProcessUser(object):
 		
 		The port is taken from the pool of available server (non-ephemeral) ports on this machine, and will not 
 		be available for use by any other code in the current PySys process until this object's `cleanup` method is 
-		called to return it to the pool of available ports. 
+		called to return it to the pool of available ports. For advanced options such as port exclusions see 
+		`pysys.utils.allocport`. 
 
 		To allocate an IPv4 port for use only on this host::
 		
@@ -1473,7 +1636,7 @@ class ProcessUser(object):
 		stack=[]
 		from pysys.basetest import BaseTest
 		if isinstance(self, BaseTest):
-			testmodule = os.path.splitext(os.path.join(self.descriptor.testDir, self.descriptor.module))[0] if self.descriptor.module else None
+			testmodule = os.path.splitext(os.path.join(self.descriptor.testDir, self.descriptor.module))[0] if self.descriptor.module != 'PYTHONPATH' else None
 			for record in inspect.stack():
 				info = inspect.getframeinfo(record[0])
 				if (self.__skipFrame(info.filename, ProcessUser) ): continue
@@ -1492,9 +1655,176 @@ class ProcessUser(object):
 		"""
 		return os.path.splitext(file)[0] == os.path.splitext(sys.modules[clazz.__module__].__file__)[0]
 
+	def grep(self, path, expr, encoding=None, reFlags=0, mappers=[], **kwargs):
+		r"""Returns the first occurrence of a regular expression in the specified file, or raises an exception if not found. 
 
-	def getExprFromFile(self, path, expr, groups=[1], returnAll=False, returnNoneIfMissing=False, encoding=None, reFlags=0, mappers=[]):
-		""" Searches for a regular expression in the specified file, and returns it. 
+		See also `grepOrNone` and `grepAll` or no-error-on-missing and return-all behaviour. 
+
+		If you want to use a grep to set the outcome of the test, use `pysys.basetest.BaseTest.assertThatGrep` or 
+		`pysys.basetest.BaseTest.assertGrep` instead. The documentation for assertGrep also 
+		provides some helpful examples of regular expressions that could also be used with this method, and tips for 
+		escaping in regular expressions. 
+
+		If you have a complex expression with multiple values to extract, you can use ``(?P<groupName>...)`` named groups 
+		in which case a dictionary is returned providing access to the individual elements::
+		
+			authInfoDict = self.grep('myserver.log', expr=r'Successfully authenticated user "(?P<username>[^"]*)" in (?P<authSecs>[^ ]+) seconds\.'))
+
+		For extracting a single value you can use an unnamed group using ``(expr)`` syntax, in which case that group is returned::
+
+			myKey = self.grep('test.txt', r'myKey="(.*)"') # on a file containing 'myKey="foobar"' would return "foobar"
+
+		.. versionadded: 2.0
+
+		:param str path: file to search (located in the output dir unless an absolute path is specified)
+
+		:param str expr: the regular expression, optionally containing named groups. 
+		
+			Remember to escape regular expression special characters such as ``.``, ``(``, ``[``, ``{`` and ``\`` if you want them to 
+			be treated as literal values. If you have a string with regex backslashes, it's best to use a 'raw' 
+			Python string so that you don't need to double-escape them, e.g. ``expr=r'function[(]"str", 123[.]4, (\d+), .*[)]'``.
+
+		:param str encoding: The encoding to use to open the file. 
+			The default value is None which indicates that the decision will be delegated 
+			to the L{getDefaultFileEncoding()} method. 
+
+		:param List[callable[str]->str] mappers: A list of filter functions that will be used to pre-process each 
+			line from the file (returning None if the line is to be filtered out). This provides a very powerful 
+			capability for filtering the file, for example `pysys.mappers.IncludeLinesBetween` 
+			provides the ability to filter in/out sections of a file. 
+			
+			Do not share mapper instances across multiple tests or threads as this can cause race conditions. 
+			
+			Added in PySys 1.6.0.
+
+		:param int reFlags: Zero or more flags controlling how the behaviour of regular expression matching, 
+			combined together using the ``|`` operator, for example ``reFlags=re.VERBOSE | re.IGNORECASE``. 
+			
+			For details see the ``re`` module in the Python standard library. Note that ``re.MULTILINE`` cannot 
+			be used because expressions are matched against one line at a time. Added in PySys 1.5.1. 
+
+		:return: A str containing the matching expression, or if the expr contains any ``(?P<groupName>...)`` named groups 
+			a dict[str,str] is returned where the keys are the groupNames. 
+		"""
+		return self.getExprFromFile(path=path, expr=expr, returnAll=False, returnNoneIfMissing=False, 
+			encoding=encoding, reFlags=reFlags, mappers=mappers, **kwargs)
+
+	def grepOrNone(self, path, expr, encoding=None, reFlags=0, mappers=[], mustExist=True, **kwargs):
+		r"""Returns the first occurrence of a regular expression in the specified file, or None if not found. 
+
+		See also `grep` and `grepAll` for error-on-missing and return-all behaviour. 
+
+		If you want to use a grep to set the outcome of the test, use `pysys.basetest.BaseTest.assertThatGrep` or 
+		`pysys.basetest.BaseTest.assertGrep` instead. The documentation for assertGrep also 
+		provides some helpful examples of regular expressions that could also be used with this method, and tips for 
+		escaping in regular expressions. 
+
+		If you have a complex expression with multiple values to extract, you can use ``(?P<groupName>...)`` named groups 
+		in which case a dictionary is returned providing access to the individual elements::
+		
+			authInfoDict = self.grepOrNone('myserver.log', 
+					expr=r'Successfully authenticated user "(?P<username>[^"]*)" in (?P<authSecs>[^ ]+) seconds\.')
+				) or {'username':'myuser', 'authSecs': '0.0'}
+
+		For extracting a single value you can use an unnamed group using ``(expr)`` syntax, in which case that group is returned::
+
+			myKey = self.grepOrNone('test.txt', r'myKey="(.*)"') or 'mydefault' # on a file containing 'myKey="foobar"' would return "foobar"
+
+		.. versionadded: 2.0
+
+		:param str path: file to search (located in the output dir unless an absolute path is specified)
+
+		:param str expr: the regular expression, optionally containing named groups. 
+		
+			Remember to escape regular expression special characters such as ``.``, ``(``, ``[``, ``{`` and ``\`` if you want them to 
+			be treated as literal values. If you have a string with regex backslashes, it's best to use a 'raw' 
+			Python string so that you don't need to double-escape them, e.g. ``expr=r'function[(]"str", 123[.]4, (\d+), .*[)]'``.
+
+		:param str encoding: The encoding to use to open the file. 
+			The default value is None which indicates that the decision will be delegated 
+			to the L{getDefaultFileEncoding()} method. 
+
+		:param List[callable[str]->str] mappers: A list of filter functions that will be used to pre-process each 
+			line from the file (returning None if the line is to be filtered out). This provides a very powerful 
+			capability for filtering the file, for example `pysys.mappers.IncludeLinesBetween` 
+			provides the ability to filter in/out sections of a file. 
+			
+			Do not share mapper instances across multiple tests or threads as this can cause race conditions. 
+			
+			Added in PySys 1.6.0.
+
+		:param bool mustExist: Set this to False to tolerate the file not existing and treat a missing file like an empty file. 
+			Added in PySys 2.2.
+
+		:param int reFlags: Zero or more flags controlling how the behaviour of regular expression matching, 
+			combined together using the ``|`` operator, for example ``reFlags=re.VERBOSE | re.IGNORECASE``. 
+			
+			For details see the ``re`` module in the Python standard library. Note that ``re.MULTILINE`` cannot 
+			be used because expressions are matched against one line at a time. Added in PySys 1.5.1. 
+
+		:return: A str containing the matching expression, None if there are no matches, 
+			or if the expr contains any ``(?P<groupName>...)`` named groups 
+			a dict[str,str] is returned where the keys are the groupNames. 
+		"""
+		return self.getExprFromFile(path=path, expr=expr, returnAll=False, returnNoneIfMissing=True, 
+			encoding=encoding, reFlags=reFlags, mappers=mappers, mustExist=mustExist, **kwargs)
+
+	def grepAll(self, path, expr, encoding=None, reFlags=0, mappers=[], mustExist=True, **kwargs):
+		r"""Returns a list of all the occurrences of a regular expression in the specified file. 
+
+		See also `grep` and `grepOrNone` for return-first-only behaviour. 
+
+		If you have a complex expression with multiple values to extract, you can use ``(?P<groupName>...)`` named groups 
+		in which case each item in the returned list is a dictionary is returned providing access to the individual elements::
+		
+			authInfoDictList = self.grepAll('myserver.log', expr=r'Successfully authenticated user "(?P<username>[^"]*)" in (?P<authSecs>[^ ]+) seconds\.'))
+
+		For extracting a single value you can use an unnamed group using ``(expr)`` syntax, in which case that group is returned::
+
+			myKey = self.grepAll('test.txt', r'myKey="(.*)"') # on a file containing 'myKey="foobar"' would return ["foobar"]
+
+		.. versionadded: 2.0
+
+		:param str path: file to search (located in the output dir unless an absolute path is specified)
+
+		:param str expr: the regular expression, optionally containing named groups. 
+		
+			Remember to escape regular expression special characters such as ``.``, ``(``, ``[``, ``{`` and ``\`` if you want them to 
+			be treated as literal values. If you have a string with regex backslashes, it's best to use a 'raw' 
+			Python string so that you don't need to double-escape them, e.g. ``expr=r'function[(]"str", 123[.]4, (\d+), .*[)]'``.
+
+		:param str encoding: The encoding to use to open the file. 
+			The default value is None which indicates that the decision will be delegated 
+			to the L{getDefaultFileEncoding()} method. 
+
+		:param List[callable[str]->str] mappers: A list of filter functions that will be used to pre-process each 
+			line from the file (returning None if the line is to be filtered out). This provides a very powerful 
+			capability for filtering the file, for example `pysys.mappers.IncludeLinesBetween` 
+			provides the ability to filter in/out sections of a file. 
+			
+			Do not share mapper instances across multiple tests or threads as this can cause race conditions. 
+			
+			Added in PySys 1.6.0.
+
+		:param bool mustExist: Set this to False to tolerate the file not existing and treat a missing file like an empty file. 
+			Added in PySys 2.2.
+
+		:param int reFlags: Zero or more flags controlling how the behaviour of regular expression matching, 
+			combined together using the ``|`` operator, for example ``reFlags=re.VERBOSE | re.IGNORECASE``. 
+			
+			For details see the ``re`` module in the Python standard library. Note that ``re.MULTILINE`` cannot 
+			be used because expressions are matched against one line at a time. Added in PySys 1.5.1. 
+
+		:return: A list where each item is a str containing the matching expression, or if the expr contains any 
+			``(?P<groupName>...)`` named groups each item is a dict[str,str] where the keys are the groupNames. 
+		"""
+		return self.getExprFromFile(path=path, expr=expr, returnAll=True, returnNoneIfMissing=False, 
+			encoding=encoding, reFlags=reFlags, mappers=mappers, mustExist=mustExist, **kwargs)
+
+	def getExprFromFile(self, path, expr, groups=[1], returnAll=False, returnNoneIfMissing=False, mustExist=True, encoding=None, reFlags=0, mappers=[]):
+		r""" Searches for a regular expression in the specified file, and returns it. 
+		
+		Use of this function is discouraged - consider using `grep` / `grepOrNone` / `grepAll` instead. 
 
 		If the regex contains unnamed groups using ``(expr)`` syntax, the specified group is returned. 
 		If the expression is not found, an exception is raised,
@@ -1523,7 +1853,7 @@ class ProcessUser(object):
 
 		:param str expr: the regular expression, optionally containing the regex group operator ``(...)``
 		
-			Remember to escape regular expression special characters such as ``.``, ``(``, ``[``, ``{`` and ``\\`` if you want them to 
+			Remember to escape regular expression special characters such as ``.``, ``(``, ``[``, ``{`` and ``\`` if you want them to 
 			be treated as literal values. If you have a string with regex backslashes, it's best to use a 'raw' 
 			Python string so that you don't need to double-escape them, e.g. ``expr=r'function[(]"str", 123[.]4, (\d+), .*[)]'``.
 
@@ -1536,6 +1866,7 @@ class ProcessUser(object):
 		:param bool returnAll: returns a list containing all matching lines if True, the first matching line otherwise.
 		:param bool returnNoneIfMissing: True to return None instead of raising an exception
 			if the regex is not found in the file (not needed when returnAll is used). 
+		:param bool mustExist: Set to False to tolerate the file not existing and treat a missing file like an empty file. 
 			
 		:param str encoding: The encoding to use to open the file. 
 			The default value is None which indicates that the decision will be delegated 
@@ -1562,30 +1893,34 @@ class ProcessUser(object):
 			
 			If returnAll=True, the return value is a list of all the match values, with types as above. 
 		"""
-		
 		namedGroupsMode = False
 		compiled = re.compile(expr, flags=reFlags)
 		namedGroupsMode = compiled.groupindex
 		
 		path = os.path.join(self.output, path)
+		
+		assert not os.path.isdir(path), 'Cannot grep directory: %s'%path
 
-		with openfile(path, 'r', encoding=encoding or self.getDefaultFileEncoding(path)) as f:
-			matches = []
-			for l in applyMappers(f, mappers):
-			
-				match = compiled.search(l)
-				if not match: continue
-				if namedGroupsMode:
-					val = match.groupdict()
-				elif match.groups():
-					val = match.group(*groups)
-				else:
-					val = match.group(0)
-					
-				if returnAll: 
-					matches.append(val)
-				else: 
-					return val
+		matches = []
+		if mustExist is False and not os.path.exists(path):
+			pass
+		else: 
+			with openfile(path, 'r', encoding=encoding or self.getDefaultFileEncoding(path)) as f:
+				for l in applyMappers(f, mappers):
+				
+					match = compiled.search(l)
+					if not match: continue
+					if namedGroupsMode:
+						val = match.groupdict()
+					elif match.groups():
+						val = match.group(*groups)
+					else:
+						val = match.group(0)
+						
+					if returnAll: 
+						matches.append(val)
+					else: 
+						return val
 
 		if returnAll: return matches
 		if returnNoneIfMissing: return None
@@ -1595,7 +1930,7 @@ class ProcessUser(object):
 
 
 	def logFileContents(self, path, includes=None, excludes=None, maxLines=20, tail=False, encoding=None, 
-			logFunction=None, reFlags=0, stripWhitespace=True, mappers=[]):
+			logFunction=None, reFlags=0, stripWhitespace=True, mappers=[], color=True):
 		""" Logs some or all of the lines from the specified file.
 		
 		If the file does not exist or cannot be opened, does nothing. The method is useful for providing key
@@ -1620,7 +1955,7 @@ class ProcessUser(object):
 			
 			Do not share mapper instances across multiple tests or threads as this can cause race conditions. 
 
-			Added in PySys 1.7.0. 
+			Added in PySys 2.0. 
 
 		:param int maxLines: Upper limit on the number of lines from the file that will be logged. Set to zero for unlimited
 		:param bool tail: Prints the _last_ 'maxLines' in the file rather than the first 'maxLines'.
@@ -1643,7 +1978,10 @@ class ProcessUser(object):
 			be used because expressions are matched against one line at a time. Added in PySys 1.5.1. 
 
 		:param bool stripWhitespace: By default blank lines are removed; set this to False to disable that behaviour. 
-			Added in PySys 1.7.0. 
+			Added in PySys 2.0. 
+		
+		:param bool color: By default logged lines are colored blue to distinguish from the rest of the log contents. 
+			Set this to False to disable coloring. Added in PySys 2.1. 
 
 		:return: True if anything was logged, False if not.
 		
@@ -1673,6 +2011,8 @@ class ProcessUser(object):
 				if stripWhitespace:
 					l = l.rstrip()
 					if len(l) == 0: continue
+				else:
+					l = l.strip('\n\r')
 				
 				if includes:
 					l = matchesany(l, includes)
@@ -1692,14 +2032,17 @@ class ProcessUser(object):
 		if not tolog:
 			return False
 		
-		logextra = BaseLogFormatter.tag(LOG_FILE_CONTENTS)
+		logextra = BaseLogFormatter.tag(LOG_FILE_CONTENTS if color else None, suppress_prefix=True)
 		if logFunction is None: 
 			def logFunction(line):
-				self.log.info(u'  %s', l, extra=logextra)
+				self.log.info(u'  %s', l, 
+					# special-case printing of lines that already have coloring - don't add any extra colors to such lines
+					extra=BaseLogFormatter.tag(None, suppress_prefix=True) if color and '\033[' in line else logextra)
 
 		path = os.path.normpath(path)
 		if path.startswith(self.output): path = path[len(self.output)+1:]
-		self.log.info(u'Contents of %s%s: ', path, ' (filtered)' if includes or excludes else '', extra=logextra)
+		self.log.info(u'Contents of %s%s: ', fromLongPathSafe(path), ' (filtered)' if includes or excludes else '', 
+			extra=BaseLogFormatter.tag(LOG_FILE_CONTENTS, suppress_prefix=False))
 		for l in tolog:
 			logFunction(l)
 		self.log.info('  -----', extra=logextra)
@@ -1771,9 +2114,8 @@ class ProcessUser(object):
 		
 			<default-file-encoding pattern="*.xml" encoding="utf-8"/>
 		
-		A return value of None indicates default behaviour, which on Python 3 is to 
-		use the default OS encoding, as specified by `pysys.constants.PREFERRED_ENCODING`, 
-		and on Python 2 is to use binary ``str`` objects with no character encoding or decoding applied. 
+		A return value of None indicates default behaviour, which is to 
+		use the default OS encoding, as specified by `pysys.constants.PREFERRED_ENCODING`. 
 		
 		:param file: The filename to be read or written. This may be an 
 			absolute path or a relative path.
@@ -1854,22 +2196,17 @@ class ProcessUser(object):
 		return pysys.utils.misc.compareVersions(v1, v2)
 
 	def write_text(self, file, text, encoding=None):
-		"""
+		r"""
 		Writes the specified characters to a file in the output directory. 
 		
 		:param file: The path of the file to write, either an absolute path or 
 			relative to the `self.output` directory. 
 		
-		:param text: The string to write to the file, with `\\n` 
+		:param text: The string to write to the file, with ``\n`` 
 			for newlines (do not use `os.linesep` as the file will be opened in 
 			text mode so platform line separators will be added automatically).
 			
-			On Python 3 this must be a character string. 
-			
-			On Python 2 this can be a character or byte string containing ASCII 
-			characters. If non-ASCII characters are used, it must be a unicode 
-			string if there is an encoding specified for this file/type, or 
-			else a byte string. 
+			This must be a character string. 
 		
 		:param encoding: The encoding to use to open the file. 
 			The default value is None which indicates that the decision will be delegated 
@@ -1911,8 +2248,70 @@ class ProcessUser(object):
 		finally:
 			pysys.internal.initlogging.pysysLogHandler.setLogHandlersForCurrentThread(saved)
 	
+	def unpackArchive(self, archive, dest=None, autoCleanup=True):
+		"""
+		Unpacks the specified file(s) from an archive to a directory. Supports archive format such as zip/tar.gz/gz/tar.xz/xz. 
+		
+		It is a good idea to store large textual Input/ assets (such as log files, which usually compress very well) 
+		as compressed archives to reduce disk space in your version control system. 
+		
+		By default this method will automatically delete the extracted file/dir during test cleanup so it doesn't sit 
+		around on disk (or in CI uploaded failure archives) consuming space; if the file/dir is mutated by the test you 
+		may wish to disable this so you can manually inspect them by setting ``autoCleanup=False``. 
+
+		For example::
+			
+			unpacked = self.unpackArchive('mybigfile.log.xz')
+			# do something with "unpacked"...
+			
+		Note that ``.xz`` (for single files) and ``.tar.xz`` (for multiple files) are recommended for optimal compression, and 
+		these (and ``.gz``) are *significantly* better than zip, which performs poorly when compressing 
+		multiple similar text files into one archive. Don't use more than one single archive per testcase (if possible) 
+		to ensure you benefit from similarities between the various files. 
+		
+		Files are decompressed in binary mode, so if you require platform-native line endings you should use `copy` to 
+		post-process them after decompressing. 
+		
+		:param str archive: The path of the archive to unpack, by default from the test input directory. Alternatively 
+			you could provide an absolute path using ``self.project.testRootDir`` or similar if an archive is shared across 
+			multiple test cases. 
+		:param str dest: The directory in which the contents of the archive will be written; by default this is the test 
+			output directory for archive types that are always single-file, and a subdirectory named after the archive if not. 
+			This dir will be created if needed. 
+		:param bool autoCleanup: Automatically deletes the unpackaged file/directory during test cleanup to save 
+			disk space (even if the test fails). 
+		
+		:return: The full path to the decompressed file or directory. 
+		
+		"""
+		self.log.info('Unpacking archive from %s to %s%s', archive, dest or '<test output dir>', ' (with auto-delete during test cleanup)' if autoCleanup else '')
+		dest = toLongPathSafe(os.path.join(self.output, dest or self.output)).rstrip('/\\')
+		self.mkdir(dest)
+		archive = os.path.join(self.input, archive)
+		
+		archivebasename = os.path.basename(archive).lower()
+		
+		if '.tar.' not in archivebasename:
+			# shutil can't do individual non-tar'd files
+
+			for ext, module in [('.xz', 'lzma'), ('.gz', 'gzip')]:
+				if archivebasename.endswith(ext):
+					dest = os.path.join(dest, os.path.basename(archive)[:-len(ext)])
+					module = importlib.import_module(module) # some compression modules are not available on all systems, so only do this on demand
+					with module.open(archive) as src, open(dest, 'wb') as decompressed:
+						shutil.copyfileobj(src, decompressed)
+						if autoCleanup: self.addCleanupFunction(lambda: self.deleteFile(dest, ignore_errors=True))
+					return dest
+		
+		# don't unpack multiple files to the output dir directly as then we can't delete them
+		if os.path.samefile(dest, toLongPathSafe(self.output)): dest = os.path.join(dest, os.path.basename(archive)[:os.path.basename(archive).find('.')])
+		if autoCleanup: self.addCleanupFunction(lambda: self.deleteDir(dest, ignore_errors=True))
+		# this takes care of multi-file archives such as tar.XXX/zip etc
+		shutil.unpack_archive(archive, dest)
+		return dest
+
 	def copy(self, src, dest, mappers=[], encoding=None, symlinks=False, ignoreIf=None, skipMappersIf=None, overwrite=None):
-		"""Copy a directory or a single text or binary file, optionally tranforming the contents by filtering each line through a list of mapping functions. 
+		r"""Copy a directory or a single text or binary file, optionally tranforming the contents by filtering each line through a list of mapping functions. 
 		
 		If any `pysys.mappers` are provided, the file is copied in text mode and 
 		each mapper is given the chance to modify or omit each line, or even reorder the lines of the file. 
@@ -1965,7 +2364,7 @@ class ProcessUser(object):
 					return '"'+self.src+'": '+line
 				
 				def fileFinished(self, srcPath, destPath, srcFile, destFile):
-					destFile.write('\\n' + 'footer added by CustomLineMapper')
+					destFile.write('\n' + 'footer added by CustomLineMapper')
 			self.copy('src.txt', 'dest.txt', mappers=[CustomLineMapper()])
 
 		.. versionchanged:: 1.6.0
@@ -1986,6 +2385,10 @@ class ProcessUser(object):
 			As a convenience to avoid repeating the same text in the src and destination, 
 			if the dest ends with a slash, or the src is a file and the dest is an existing directory, 
 			the dest is taken as a parent directory into which the src will be copied in retaining its current name. 
+			
+			It is best to avoid copies where the src dir already contains the dest (which would be recursive) such as 
+			copying the test dir (possibly configured as ``self.input``) to destination ``self.output``, however if this 
+			is attempted PySys will log a warning and copy everything else except the recursive part. 
 		
 		:param bool overwrite: If True, source files will be allowed to 
 			overwrite destination files, if False an exception will be raised if a destination file already exists. 
@@ -1995,7 +2398,7 @@ class ProcessUser(object):
 			in order, to map each line from source to destination. Each function accepts a string for 
 			the current line as input and returns either a string to write or 
 			None if the line is to be omitted. Any ``None`` items in the mappers list will be ignored. 
-			Mappers must always preserve the final ``\\n`` of each line (if present). 
+			Mappers must always preserve the final ``\n`` of each line (if present). 
 			
 			See `pysys.mappers` for some useful predefined mappers such as `pysys.mappers.IncludeLinesBetween`, 
 			`pysys.mappers.RegexReplace` and `pysys.mappers.SortLines`. 
@@ -2029,7 +2432,8 @@ class ProcessUser(object):
 	
 		dest = toLongPathSafe(os.path.join(self.output, dest)).rstrip('/\\')
 		if origdest.endswith((os.sep, '/', '\\')) or (not srcIsDir and os.path.isdir(dest)): dest = toLongPathSafe(dest+os.sep+os.path.basename(src))
-	
+
+		self.log.debug('Copying %s to %s', src, dest)
 		if src == dest and not srcIsDir:
 			dest = src+'__pysys_copy.tmp'
 			renameDestAtEnd = True
@@ -2042,28 +2446,24 @@ class ProcessUser(object):
 		if srcIsDir:
 			destexists = os.path.isdir(dest)
 			if not destexists: self.mkdir(dest)
-			scandir = getattr(os, 'scandir', None)
-			for e in (os.listdir(src) if scandir is None else scandir(src)):
-				if scandir is None: # for python2 support
-					path = os.path.join(src, e)
-					isdir = os.path.isdir(path)
-					islink = os.path.islink(path)
-				else:
-					isdir = e.is_dir()
-					islink = e.is_symlink()
+			with os.scandir(src) as iterator:
+				for e in iterator:
 					path = e.path
-				
-				if ignoreIf is not None and ignoreIf(path): continue
-				
-				if islink and symlinks:
-					linkdest = dest+os.sep+os.path.basename(path)
-					os.symlink(os.readlink(path), linkdest)
-					shutil.copystat(path, linkdest, **({} if PY2 else {'follow_symlinks':False}))
-					continue
-				
-				self.copy(path, dest+os.sep+os.path.basename(path), 
-					# must pass all other arguments through
-					mappers=mappers, encoding=encoding, symlinks=symlinks, ignoreIf=ignoreIf, skipMappersIf=skipMappersIf, overwrite=overwrite)
+					
+					if ignoreIf is not None and ignoreIf(path): continue
+					if dest.lower().startswith(path.lower()+os.sep):
+						self.log.warning(f'Copy will ignore {dest[len(src):]} while copying from {src} to avoid recursive copy; it is best to avoid having a source path that is a parent dir of the destination')
+						continue
+
+					if e.is_symlink() and symlinks:
+						linkdest = dest+os.sep+os.path.basename(path)
+						os.symlink(os.readlink(path), linkdest)
+						shutil.copystat(path, linkdest, follow_symlinks=False)
+						continue
+					
+					self.copy(path, dest+os.sep+os.path.basename(path), 
+						# must pass all other arguments through
+						mappers=mappers, encoding=encoding, symlinks=symlinks, ignoreIf=ignoreIf, skipMappersIf=skipMappersIf, overwrite=overwrite)
 				
 			return dest
 
@@ -2095,6 +2495,73 @@ class ProcessUser(object):
 		shutil.copystat(src, dest)
 		if renameDestAtEnd:
 			os.remove(src)
-			os.rename(dest, src)
+			try:
+				os.rename(dest, src)
+			except Exception: # pragma: no cover - work around windows file locking issues
+				self.pollWait(20)
+				os.rename(dest, src)
+			return src
+			
 		return dest
+	
+	def createThreadPoolExecutor(self, maxWorkers=None) -> concurrent.futures.ThreadPoolExecutor:
+		"""
+		Create a PySys-friendly instance of Python's ThreadPoolExecutor, configured with support for PySys loggers,  
+		cleanup, and a recommended default number of workers. 
+
+		During cleanup, the thread pool is shutdown, with any unstarted futures cancelled (requires Python 3.9+), and a wait 
+		until all in-progress futures have completed.
 		
+		This is useful for tests that need to perform many latency-bound operations such as making HTTP requests. 
+		Do not use it for starting lots of processes in parallel and waiting for them, since that is more easily achieved 
+		using `waitForBackgroundProcesses()`. 
+		
+		If you use ``submit`` (rather than ``map``), then any exceptions during the submitted job will not be logged anywhere 
+		unless you you wait for the submitted job (or add an exception handler). 
+		Note that this class is not thread-safe (apart from ``addOutcome``, ``startProcess`` and the reading of fields 
+		like ``self.output`` that don't change) so if you need to use its fields or methods from background threads, 
+		be sure to add your own locking to the foreground and background threads in your test, including any custom cleanup 
+		functions. 
+
+		Example usage::
+		
+			tp = self.createThreadPoolExecutor()
+			results = tp.map(items, makeHTTPRequest)
+
+			# Or for more complex use cases:
+			submittedFutures = []
+			submittedFutures.append(tp.submit(...))
+			concurrent.futures.wait(submittedFutures)
+
+		.. versionadded:: 2.2
+
+		:param int maxWorkers: Overrides the maximum number of worker threads that can be created by this pool. 
+			Only override this if needed. The default maxWorkers is configured in ``self.threadPoolMaxWorkers`` and is 
+			currently set at 6 since a higher number might overload a machine (or Python, due to the GIL) if pools are used by
+			many/all of the PySys workers/tests running in parallel. The default may change in future. 
+
+			If overriding this value, use a small number of workers for Python-based logic that will hold the Python 
+			Global Interpreter Lock, or a larger/more scalable number of workers for heavily I/O-bound operations with little Python logic. 
+		
+		:return: A ``concurrent.futures.ThreadPoolExecutor`` instance.
+
+		"""
+		if not maxWorkers: maxWorkers = self.threadPoolMaxWorkers
+
+		log.info('Created thread pool with %s workers', maxWorkers) # be explicit, since number of workers could affect test race conditions
+		pool = concurrent.futures.ThreadPoolExecutor(max_workers=maxWorkers, initializer=pysys.utils.threadutils.createThreadInitializer(self))
+		def cleanupThreadPool():
+			log.info('Shutting down thread pool')
+
+			starttime = time.monotonic()
+			if sys.version_info[:2] >= (3, 9):
+				pool.shutdown(wait=True, cancel_futures=True)
+			else:
+				pool.shutdown(wait=True)
+			(log.info if time.monotonic()-starttime>5 else log.debug)('Completed shutdown of thread pool after %0.1f seconds', time.monotonic()-starttime)
+
+		self.addCleanupFunction(cleanupThreadPool)
+		return pool
+
+if not IS_WINDOWS:
+	ProcessUser.isInterruptTerminationInProgressHandle, ProcessUser._isInterruptTerminationInProgressWriteHandle = os.pipe()

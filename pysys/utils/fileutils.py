@@ -1,6 +1,6 @@
 # -*- coding: latin-1 -*-
 #!/usr/bin/env python
-# PySys System Test Framework, Copyright (C) 2006-2020 M.B. Grieve
+# PySys System Test Framework, Copyright (C) 2006-2022 M.B. Grieve
 
 # This library is free software; you can redistribute it and/or
 # modify it under the terms of the GNU Lesser General Public
@@ -25,14 +25,15 @@ import os, shutil, time, locale
 import collections
 import json
 import logging
+import io
+import stat
 
 from pysys.constants import IS_WINDOWS, PREFERRED_ENCODING
-from pysys.utils.pycompat import PY2, openfile
 
 log = logging.getLogger('pysys.fileutils')
 
 def toLongPathSafe(path, onlyIfNeeded=False):
-	"""
+	r"""
 	Converts the specified path string to a form suitable for passing to API 
 	calls if it exceeds the maximum path length on this OS. 
 	
@@ -42,13 +43,11 @@ def toLongPathSafe(path, onlyIfNeeded=False):
 	letters so they are always upper case regardless of OS version and current 
 	working directory. 
 	
-	:param str path: A path. Must not be a relative path. Can be None/empty. Can 
-		contain ".." sequences. If possible, use a unicode character string. 
-		On Python 2, byte strings are permitted and converted using 
-		``PREFERRED_ENCODING``. Note that no normalization of ".." 
-		sequences and slashes is performed if the OS starts with ``\\?\`` already 
+	:param str path: An absolute (not relative) path. Can be None/empty. Can 
+		contain ".." sequences. Note that no normalization of ".." 
+		sequences and slashes is performed if the path starts with ``\\?\`` already 
 		or is non-Windows so if in doubt run the path through ``os.path.normpath`` 
-		before calling this method on it (``\\?\`` paths with incorrect slashes or .. sequences 
+		before calling this method on it (``\\?\`` paths with incorrect slashes and ``..`` sequences 
 		are not permitted by Windows). 
 	
 	:param bool onlyIfNeeded: Set to True to only adds the long path support if this 
@@ -57,16 +56,12 @@ def toLongPathSafe(path, onlyIfNeeded=False):
 		returned string. 
 	
 	:return: The passed-in path, possibly with a ``\\?\`` prefix added, 
-		forward slashes converted to backslashes on Windows, and converted to 
-		a unicode string. Trailing slashes may be removed. 
-		Note that the conversion to unicode requires a lot of care on Python 2 
-		where byte strings are more common, since it is not possible to combine 
-		unicode and byte strings (if they have non-ascii characters), for example 
-		for a log statement. 
+		forward slashes converted to backslashes on Windows, and drive letter capitalized. 
+		Trailing slashes may be removed. 
 	
 	"""
 	if (not IS_WINDOWS) or (not path): return path
-	if path[0] != path[0].upper(): path = path[0].upper()+path[1:]
+	if path[0] != path[0].upper() and os.path.isabs(path): path = path[0].upper()+path[1:]
 	if onlyIfNeeded and len(path)<255: return path
 	if path.startswith(u'\\\\?\\'): 
 		if u'/' in path: return path.replace(u'/',u'\\')
@@ -82,9 +77,6 @@ def toLongPathSafe(path, onlyIfNeeded=False):
 		# consecutive \ separators are not permitted in \\?\ paths
 			path = path.replace('\\\\','\\')
 
-	if PY2 and isinstance(path, str):
-		path = path.decode(PREFERRED_ENCODING)
-	
 	if path.startswith(u'\\\\'): 
 		path = u'\\\\?\\UNC\\'+path.lstrip('\\') # \\?\UNC\server\share
 	else:
@@ -92,12 +84,8 @@ def toLongPathSafe(path, onlyIfNeeded=False):
 	return path
 
 def fromLongPathSafe(path):
-	"""
+	r"""
 	Strip off ``\\?\`` prefixes added by L{toLongPathSafe}. 
-	
-	Note that this function does not convert unicode strings back to byte 
-	strings, so if you want a complete reversal of toLongPathSafe you will 
-	additionally have to call C{result.encode(PREFERRED_ENCODING)}.
 	"""
 	if not path: return path
 	if not path.startswith('\\\\?\\'): return path
@@ -108,19 +96,18 @@ def fromLongPathSafe(path):
 	return result
 
 def pathexists(path):
-	""" Returns True if the specified path is an existing file or directory, 
+	r""" Returns True if the specified path is an existing file or directory, 
 	as returned by C{os.path.exists}. 
 	
 	This method is safe to call on paths that may be over the Windows 256 
 	character limit. 
 	
-	:param path: If None or empty, returns True. Only Python 2, can be a 
-		unicode or byte string. 
+	:param path: If None or empty, returns True.
 	"""
 	return path and os.path.exists(toLongPathSafe(path))
 
 def mkdir(path):
-	"""
+	r"""
 	Create a directory, with recursive creation of any parent directories.
 	
 	This function is a no-op (does not throw) if the directory already exists. 
@@ -142,11 +129,13 @@ def mkdir(path):
 	return origpath
 
 def deletedir(path, retries=1, ignore_errors=False, onerror=None):
-	"""
+	r"""
 	Recursively delete the specified directory, with optional retries. 
 	
 	Does nothing if it does not exist. Raises an exception if the deletion fails (unless ``onerror=`` is specified), 
 	but deletes as many files as possible before doing so. 
+	
+	This method will attempt to change the permissions/file attributes to permit deletion if necessary. 
 	
 	:param retries: The number of retries to attempt. This can be useful to 
 		work around temporary failures causes by Windows file locking. 
@@ -160,12 +149,25 @@ def deletedir(path, retries=1, ignore_errors=False, onerror=None):
 	
 	path = toLongPathSafe(path)
 	try:
+		def pysysOnError(function, path, excinfo):
+			try: # helps with both Windows "readonly" attribute and linux permissions issues
+				perms = stat.S_IWRITE | stat.S_IREAD
+				if os.path.isdir(path): perms = perms | stat.S_IEXEC
+				os.chmod(path, perms | stat.S_IMODE(os.lstat(path).st_mode))
+				if os.path.isdir(path):
+					os.rmdir(path)
+				else:
+					os.remove(path)
+			except Exception as ex:
+				log.debug('deletedir failed to update permissions and delete %s on this attempt: %s', path, ex)
+				pass
+
 		# delete as many files as we can first, so if there's an error deleting some files (e.g. due to windows file 
-		# locking) we don't use any more disk space than we need to
-		shutil.rmtree(path, ignore_errors=True)
+		# locking) we don't use any more disk space than we need to. This is ignores errors BUT attempts to change permissions first
+		shutil.rmtree(path, onerror=pysysOnError)
 		
 		# then try again, being more careful
-		if os.path.exists(path) and not ignore_errors:
+		if os.path.exists(path) and not ignore_errors:					
 			shutil.rmtree(path, onerror=onerror)
 	except Exception as ex: # pragma: no cover
 		if not os.path.exists(path): return # nothing to do
@@ -173,10 +175,11 @@ def deletedir(path, retries=1, ignore_errors=False, onerror=None):
 			raise
 		time.sleep(1.0) # work around windows file-locking issues
 		log.debug('Retrying directory deletion of "%s" %d times after %s', path, retries, ex)
+		
 		deletedir(path, retries = retries-1, onerror=onerror)
 
 def deletefile(path, retries=1, ignore_errors=False):
-	"""
+	r"""
 	Delete the specified file, with optional retries. 
 	
 	Does nothing if it does not exist. 
@@ -203,8 +206,46 @@ def deletefile(path, retries=1, ignore_errors=False):
 		log.debug('Retrying file deletion of "%s" %d times after %s', path, retries, ex)
 		deletefile(path, retries = retries-1, ignore_errors=ignore_errors)
 
-def loadProperties(path, encoding='utf-8-sig'):
+def listDirContents(path, recurse=True):
+	r"""
+	Recursively scans the specified directory and returns a sorted list of the file/directory paths under it suitable 
+	for diffing. 
+	
+	The contents are returned in a normalized form suitable for diffing: relative to the scanned path, with forward 
+	slashes on all platforms, a trailing slash for directories, and sorted to ensure deterministic results. 
+	Symbolic links are not searched. 
+	
+	For example this can be used with `pysys.basetest.BaseTest.assertDiff` like this::
+	
+	  self.assertDiff(
+	    self.write_text('MyDir-contents.txt', '\\n'.join(
+	      pysys.utils.fileutils.listDirContents(self.output+'/MyDir')
+	  )))
+	  
+	
+	:param str path: The absolute path to search.
+	:param bool recurse: Set this to False to just include the specified directory but not any children. 
+	:return: A list of strings with the relative paths found, e.g. ``["mysubdir/myfile.txt", "mysubdir/mysubsubdir/"]``. 
+	
+	.. versionadded:: 2.0
 	"""
+	assert os.path.isabs(path), 'Must specify an absolute path: %r'%path
+	path = toLongPathSafe(path)
+	stripchars = len(path)+1
+	
+	def listRecursively(d):
+		result = []
+		with os.scandir(d) as it:
+			items = sorted((x for x in it), key=lambda x: (x.is_dir(follow_symlinks=False), x.name))
+			for x in items:
+				yield (x.path[stripchars:].replace('\\', '/')+('/' if x.is_dir(follow_symlinks=False) else ''))
+				if recurse and x.is_dir(follow_symlinks=False):
+					yield from listRecursively(x.path)
+
+	return list(listRecursively(path))
+
+def loadProperties(path, encoding='utf-8-sig'):
+	r"""
 	Reads keys and values from the specified ``.properties`` file. 
 	
 	Support ``#`` and ``!`` comments but does not perform any special handling of backslash ``\\`` characters 
@@ -213,13 +254,13 @@ def loadProperties(path, encoding='utf-8-sig'):
 	performed manually on the returned values. 
 	
 	:param str path: The absolute path to the properties file. 
-	:param str encoding: The encoding to use (unless running under Python 2 in which case byte strings are always returned). 
+	:param str encoding: The encoding to use. 
 		The default is UTF-8 (with optional Byte Order Mark). 
 	:return dict[str:str]: An ordered dictionary containing the keys and values from the file. 
 	"""
 	assert os.path.isabs(path), 'Cannot use relative path: "%s"'%path
 	result = collections.OrderedDict()
-	with openfile(path, mode='r', encoding=None if PY2 else encoding, errors='strict') as fp:
+	with io.open(path, mode='r', encoding=encoding, errors='strict') as fp:
 		for line in fp:
 			line = line.lstrip()
 			if len(line)==0 or line.startswith(('#','!')): continue
@@ -231,7 +272,7 @@ def loadProperties(path, encoding='utf-8-sig'):
 
 
 def loadJSON(path, **kwargs):
-	"""
+	r"""
 	Reads JSON from the specified path. 
 	
 	This is a small wrapper around Python's ``json.load()`` function. 
@@ -241,6 +282,7 @@ def loadJSON(path, **kwargs):
 	:return obj: A dict, list, or other Python object representing the contents of the JSON file. 
 	"""
 	assert os.path.isabs(path), 'Cannot use relative path: "%s"'%path
-	with openfile(path, mode='r', encoding='utf-8-sig', errors='strict') as fp:
+	with io.open(path, mode='r', encoding='utf-8-sig', errors='strict') as fp:
 		return json.load(fp, **kwargs)
-		
+
+openfile = io.open # alias after pycompat was deprecated

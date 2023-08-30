@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-# PySys System Test Framework, Copyright (C) 2006-2020 M.B. Grieve
+# PySys System Test Framework, Copyright (C) 2006-2022 M.B. Grieve
 
 # This library is free software; you can redistribute it and/or
 # modify it under the terms of the GNU Lesser General Public
@@ -22,15 +22,17 @@ and `pysys.basetest.BaseTest.assertGrep`.
 This package contains several pre-defined mappers:
 
 .. autosummary::
-	RegexReplace
-	IncludeLinesBetween
+	IncludeMatches
 	IncludeLinesMatching
+	IncludeLinesBetween
 	ExcludeLinesMatching
+	RegexReplace
 	JoinLines
 	JoinLines.PythonTraceback
 	JoinLines.JavaStackTrace
 	JoinLines.AntBuildFailure
 	SortLines
+	TruncateLongLines
 	applyMappers
 
 In addition to the above, you can create custom mappers, which are usually callables (functions, lambdas, or classes 
@@ -57,15 +59,19 @@ log = logging.getLogger('pysys.mappers')
 
 class RegexReplace(object):
 	"""
-	Mapper that transforms lines by replacing all character sequences matching the specified regular expression. 
+	Mapper that substitutes all character sequences matching the specified regular expression with something different. 
 	
 	For example::
 	
 		self.copy('myfile.txt', 'myfile-processed.txt', mappers=[RegexReplace(RegexReplace.DATETIME_REGEX, '<timestamp>')])
 	
+	This mapper returns all lines whether or not any substitutions occur. To return only the parts of lines that match 
+	a regular expression, use `IncludeMatches` instead.
+
+	
 	:param str|compiled_regex regex: The regular expression to search for. 
 	:param str replacement: The string to replace it with. This can contain backslash references to groups in the 
-		regex; see ``re.sub()`` in the Python documentation for more information. 
+		regex such as ``\\1`` for the first ``(...)`` group (see ``re.sub()`` in the Python documentation for more information). 
 
 
 	>>> RegexReplace(RegexReplace.DATETIME_REGEX, '<timestamp>')('Test string x=2020-07-15T19:22:34+00:00.')
@@ -134,6 +140,9 @@ class IncludeLinesBetween(object):
 	
 	:param str|callable[str]->bool startAt: If it matches then the current line and subsequent lines are included 
 		(not filtered out). If not specified, lines from the start of the file onwards are matched. 
+
+	:param str|callable[str]->bool startAfter: If it matches then the subsequent lines are included 
+		(not filtered out). If not specified, lines from the start of the file onwards are matched. 
 		
 	:param str|callable[str]->bool stopAfter: If it matches then lines after the current one are filtered out 
 		(unless/until a line matching startAt is found). Includes the stop line. 
@@ -148,6 +157,9 @@ class IncludeLinesBetween(object):
 	>>> _mapperUnitTest( IncludeLinesBetween(startAt='start.*'), 'a|start line|b|c').replace('\\n','')
 	'start line|b|c'
 
+	>>> _mapperUnitTest( IncludeLinesBetween(startAfter='start.*'), 'a|start line|b|c').replace('\\n','')
+	'b|c'
+
 	>>> _mapperUnitTest( IncludeLinesBetween(startAt=lambda l: l.startswith('start')), 'a|start line|b|c').replace('\\n','')
 	'start line|b|c'
 
@@ -157,16 +169,22 @@ class IncludeLinesBetween(object):
 	>>> _mapperUnitTest( IncludeLinesBetween(stopBefore='stopbefore.*'), 'a|b|stopbefore|c')
 	'a\\n|b\\n'
 
+	.. versionchanged:: 2.0 Added startAfter
+
 	"""
-	def __init__(self, startAt=None, stopAfter=None, stopBefore=None):
+	def __init__(self, startAt=None, stopAfter=None, startAfter=None, stopBefore=None):
 		self.__str = 'IncludeLinesBetween(%s)'%', '.join('%s=%s'%(k, repr(v)) for (k,v) in {
 			'startAt':startAt,
+			'startAfter':startAfter,
 			'stopAfter':stopAfter,
 			'stopBefore':stopBefore,
 		}.items() if v is not None)
 	
 		if startAt is not None and not callable(startAt): self.startAt = _createRegexMatchFunction(startAt)
 		else: self.startAt = startAt
+
+		if startAfter is not None and not callable(startAfter): self.startAfter = _createRegexMatchFunction(startAfter)
+		else: self.startAfter = startAfter
 			
 		if stopAfter is not None and not callable(stopAfter): self.stopAfter = _createRegexMatchFunction(stopAfter)
 		else: self.stopAfter = stopAfter or (lambda line: False)
@@ -174,13 +192,13 @@ class IncludeLinesBetween(object):
 		if stopBefore is not None and not callable(stopBefore): self.stopBefore = _createRegexMatchFunction(stopBefore)
 		else: self.stopBefore = stopBefore or (lambda line: False)
 		
-		self.__including = self.startAt is None
+		self.__including = self.startAt is None and self.startAfter is None
 
 	def __repr__(self): return self.__str
 
 	def fileStarted(self, srcPath, destPath, srcFile, destFile):
 		# reset every time we start a new file
-		self.__including = self.startAt is None
+		self.__including = self.startAt is None and self.startAfter is None
 
 	def __call__(self, line):
 		if self.__including:
@@ -194,6 +212,9 @@ class IncludeLinesBetween(object):
 			if self.startAt is not None and self.startAt(line):
 				self.__including = True
 				return line
+			if self.startAfter is not None and self.startAfter(line):
+				self.__including = True
+				return None
 		return None
 
 
@@ -248,7 +269,7 @@ class JoinLines(object):
 	>>> _mapperUnitTest( JoinLines(startAt='startat.*', stopBefore='stopbefore.*'), 'startat START|  stack1|  stack2 | stopbefore NEXT LINE|d|startat2|stopbefore2')
 	'startat START / stack1 / stack2| stopbefore NEXT LINE|d|startat2|stopbefore2|'
 
-	.. versionadded:: 1.7.0
+	.. versionadded:: 2.0
 	"""
 	def __init__(self, startAt=None, continueWhile=None, stopAfter=None, stopBefore=None, combiner=None):
 		assert startAt is not None
@@ -257,7 +278,7 @@ class JoinLines(object):
 		
 		self.__str = 'JoinLines(%s)'%', '.join('%s=%s'%(k, repr(v)) for (k,v) in {
 			'startAt':startAt,
-			'stopAfter':stopAfter,
+			'continueWhile':continueWhile,
 			'stopAfter':stopAfter,
 			'stopBefore':stopBefore,
 			'combiner':combiner,
@@ -423,7 +444,7 @@ def SortLines(key=None):
 
 		As this mapper is stateful, do not use a single instance of it in multiple tests (or multiple threads). 
 
-		.. versionadded:: 1.7.0
+		.. versionadded:: 2.0
 
 		:param callable[str]->str key: A callable that returns the sort key to use for each line, in case you want 
 			something other than the default lexicographic sorting. 
@@ -443,23 +464,61 @@ def SortLines(key=None):
 		def mapperGenerator(it):
 			for l in sorted(it, key=key):
 				if not l.endswith('\n'): l += '\n' # need uniform newlines in output since it's possible there aren't uniform newlines in input (if file doesn't end in a newline)
-				yield l # = yield from
+				yield l
 		return mapperGenerator
 
-class IncludeLinesMatching(object):
+class IncludeMatches(object):
 	"""
-	Mapper that filters lines by including only lines matching the specified regular expression. 
+	Mapper that returns only text matching the specified regular expression.
 	
 	:param str|compiled_regex regex: The regular expression to match (this is a match not a search, so 
 		use ``.*`` at the beginning if you want to allow extra characters at the start of the line).  
-		Multiple expressions can be combined using ``(expr1|expr2)`` syntax. 
+		Multiple expressions can be combined (efficiently) using ``(expr1|expr2)`` syntax. 
+	
+	:param str repl: By default this mapper returns the entire match, but instead set this to a replacement 
+		string such as ``\\1 \\2`` to return only the specified ``(...)`` groups from the match (see the Python MatchObject 
+		``expand`` method). 
+	
+	>>> IncludeMatches('F..')('Foo bar\\n')
+	'Foo\\n'
 
+	>>> IncludeMatches('F..')('Foo bar')
+	'Foo'
+
+	>>> IncludeMatches('.*(oo) *(.*)', repl='\\\\1-\\\\2')('Foo bar\\n')
+	'oo-bar\\n'
+
+	.. versionadded:: 2.2
+	"""
+	
+	def __init__(self, regex, repl=None):
+		self.__str = 'IncludeMatches(%s%s)'%(regex, f', repl={repl}' if repl else '')
+		self.regex = re.compile(regex) if isstring(regex) else regex
+		self.repl=repl
+
+	def __call__(self, line):
+		m = self.regex.match(line)
+		if m is None: return None
+		return _preserveNewlines(line, m.group(0) if self.repl is None else m.expand(self.repl))
+
+	def __repr__(self): return self.__str
+
+class IncludeLinesMatching(object):
+	"""
+	Mapper that filters lines by returning only lines matching the specified regular expression.
+	
+	To return only the matching parts of the lines, use `IncludeMatches` instead.
+	
+	:param str|compiled_regex regex: The regular expression to match (this is a match not a search, so 
+		use ``.*`` at the beginning if you want to allow extra characters at the start of the line).  
+		Multiple expressions can be combined (efficiently) using ``(expr1|expr2)`` syntax. 
+	
 	>>> IncludeLinesMatching('Foo.*')('Foo bar\\n')
 	'Foo bar\\n'
 
 	>>> IncludeLinesMatching('bar.*')('Foo bar\\n') is None
 	True
-
+	
 	"""
 	
 	def __init__(self, regex):
@@ -497,6 +556,41 @@ class ExcludeLinesMatching(object):
 
 	def __repr__(self): return self.__str
 
+class TruncateLongLines(object):
+	"""
+	Mapper that truncates any excessively long lines, to avoid regular expression matching taking 
+	an unreasonable amount of time. 
+
+	Occasionally log files can contain lines with a large dump of debugging data, which typically 
+	don't need to be checked when grepping the logs but unfortunately can cause debilitating slowness 
+	in Python since some regular expressions take an extremely long time to evaluate against long 
+	strings. This mapper can be added to avoid this problem by truncating log lines to a reasonable length.  
+
+	:param int maxLineLength: The maximum number of characters per line.  
+
+	>>> TruncateLongLines() ('Short line\\n')
+	'Short line\\n'
+
+	>>> TruncateLongLines(13) ('Long line AAAAAAAAAAA\\n')
+	'Long line AAA <truncated by PySys>\\n'
+
+	>>> len(TruncateLongLines() ('a'*20000) ) < 10000+30
+	True
+	
+	.. versionadded:: 2.2
+	"""
+	
+	def __init__(self, maxLineLength=5*1000):
+		self.__str = 'TruncateLongLines(%s)'%(maxLineLength)
+		self.maxLineLength = maxLineLength
+
+	def __call__(self, line):
+		if len(line) > self.maxLineLength:
+			return _preserveNewlines(line, line[:self.maxLineLength]+' <truncated by PySys>')
+		return line
+
+	def __repr__(self): return self.__str
+
 def applyMappers(iterator, mappers):
 	"""
 	A generator function that applies zero or more mappers to each line from an iterator and yields each fully mapped line. 
@@ -523,11 +617,10 @@ def applyMappers(iterator, mappers):
 	
 	:rtype: Iterable[str]
 	
-	.. versionadded:: 1.7.0
+	.. versionadded:: 2.0
 	"""
 	if len(mappers)==0: # optimize for common case of zero mappers
-		for x in iterator: 
-			yield x # from python 3 this could be a "yield from"
+		yield from iterator
 
 	# strip out any noop (None) mappers
 	if None in mappers: mappers = [m for m in mappers if m]
@@ -550,8 +643,7 @@ def applyMappers(iterator, mappers):
 						yield l
 			m = generatorFunctionForSimpleMapper
 		
-		for l in applyMappers(m(iterator), mappers[1:]):
-			yield l # = yield from
+		yield from applyMappers(m(iterator), mappers[1:])
 
 	else: # simple, fast implementation for the non-generators case
 		for originalline in iterator:
@@ -565,4 +657,8 @@ def applyMappers(iterator, mappers):
 				
 				yield l
 
-	
+def _preserveNewlines(orig, newstring):
+	# for now ignore \r's
+	if newstring.endswith('\n'): return newstring # nothing to do
+	if orig.endswith('\n'): return newstring+'\n'
+	return newstring

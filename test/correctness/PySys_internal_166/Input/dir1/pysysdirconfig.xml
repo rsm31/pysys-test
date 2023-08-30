@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<pysysdirconfig>
+    <modes>lambda helper: helper.combineModeDimensions(
+			[
+				<!-- automatic mode strings, including numbers.
+					Initial letter of mode will be auto-capitalized 
+				-->
+				{"database":"mySQL",  "browser":"Firefox"},
+				{"database":"SQLite", "browser":"Firefox", "isPrimary":True},
+				{"database":"SQLite",  "browser":"Chrome", "isPrimary":True},
+			], 
+			helper.inheritedModes,
+			<!-- Empty dimensions are ignored -->
+			[],
+
+			[
+				<!-- default pattern will be param=value except for numbers/booleans/blanks -->
+				{"testKind":"SmokeTest", "maxHours":1.5, "fast": "tRue"},
+				{"testKind":"SoakTest", "maxHours":"5", "fast": ''}
+			])
+		</modes>
+</pysysdirconfig>

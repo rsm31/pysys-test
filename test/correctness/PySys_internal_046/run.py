@@ -76,6 +76,9 @@ class PySysTest(BaseTest):
 		self.assertThatGrep('myserver.log', r'Successfully authenticated user "([^"]*)" in (?P<authSecs>[^ ]+) seconds', "0.0 <= float(value) <= 60.0")
 		self.assertThatGrep('myserver.log', r'Successfully authenticated user "(?P<username>[^"]*)" in (?P<authSecs>[^ ]+) seconds', "value['username'] == expected", expected='myuser')
 
+		self.assertThatGrep('myserver.log', r'Successfully authenticated user ".*" in ([^ ]+) seconds', 
+			"re.match(detailRegex, value)", detailRegex=r"[0-9]+\.[0-9]$")
+
 		MAX_AUTH_TIME = 60
 		
 		self.assertThat('username == expected', expected='myuser',
@@ -115,6 +118,9 @@ class PySysTest(BaseTest):
 				pysys.mappers.IncludeLinesBetween('Error message.* - stack trace is:', stopBefore='^$'),
 			])
 
+		# Check final newlines aren't captured by assertThatGrep, but trailing spaces are
+		self.assertThatGrep(self.input+'/file.txt', r'Waiving grain wide over the plain delights the weary ([^x]*)', 
+		      expected='farmer, ')
 		
 	def checkForFailedOutcome(self):
 		outcome = self.outcome.pop()

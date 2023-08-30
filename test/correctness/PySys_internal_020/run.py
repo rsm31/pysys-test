@@ -1,5 +1,5 @@
+import pysys
 from pysys.constants import *
-from pysys.utils.pycompat import PY2
 from pysys.basetest import BaseTest
 from pysys.process.helper import ProcessWrapper
 
@@ -35,16 +35,29 @@ class PySysTest(BaseTest):
 		self.waitForGrep('counter.out', expr='Count is 1', timeout=4)
 		self.waitForGrep('counter.err', expr='Process id of test executable', timeout=4)	
 
+		def myProcessFactory(**kwargs):
+			kwargs['arguments'].append(3)
+			return pysys.process.helper.ProcessImpl(**kwargs)
+			
+		self.startProcess(command=sys.executable,
+						  arguments = [script, "2"],
+						  environs = os.environ,
+						  workingDir = self.output,
+						  stdouterr="custom-processFactory",
+						  ignoreExitStatus=True,
+						  processFactory=myProcessFactory,
+						  state=FOREGROUND)
+
 		
 	def validate(self):
 		# check the sdtout of the process
 		self.assertDiff('counter.out', 'ref_counter.out')
 		
 		# check the stderr of the process
-		if PY2 or sys.prefix != sys.base_prefix:
+		if (sys.prefix != sys.base_prefix):
 			self.log.info('Skipping pid check because it doesnt work in a python venv')
 		else:
-			self.assertGrep('counter.err', expr='Process id of test executable is %d' % self.hprocess.pid)
+			self.assertThatGrep('counter.err', '.*', expected='Process id of test executable is %d' % self.hprocess.pid)
 		
 		# check the return status of the process
 		self.assertTrue(self.hprocess.exitStatus == 3)

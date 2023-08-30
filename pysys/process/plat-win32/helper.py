@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-# PySys System Test Framework, Copyright (C) 2006-2020 M.B. Grieve
+# PySys System Test Framework, Copyright (C) 2006-2022 M.B. Grieve
 
 # This library is free software; you can redistribute it and/or
 # modify it under the terms of the GNU Lesser General Public
@@ -22,17 +22,14 @@
 
 import string, os.path, time, logging, sys, threading, platform
 
-import win32api, win32pdh, win32security, win32process, win32file, win32pipe, win32con, pywintypes, win32job
+import win32api, win32pdh, win32security, win32process, win32file, win32pipe, win32con, pywintypes, win32job, win32event
 
-if sys.version_info[0] == 2:
-	import Queue
-else:
-	import queue as Queue
+import queue as Queue
 
 from pysys import process_lock
 from pysys.constants import *
 from pysys.exceptions import *
-from pysys.process import Process, _stringToUnicode
+from pysys.process import Process
 
 # check for new lines on end of a string
 EXPR = re.compile(".*\n$")
@@ -98,36 +95,107 @@ class ProcessImpl(Process):
 		
 		self.__lock = threading.Lock() # to protect access to the fields that get updated
 
-		# on Python 2, convert byte strings to unicode strings
-		self.stdout = u'nul' if (not self.stdout) else _stringToUnicode(self.stdout.replace('/',os.sep))
-		self.stderr = u'nul' if (not self.stderr) else _stringToUnicode(self.stderr.replace('/',os.sep))
+		self.stdout = u'nul' if (not self.stdout) else self.stdout.replace('/',os.sep)
+		self.stderr = u'nul' if (not self.stderr) else self.stderr.replace('/',os.sep)
 		
 
 		# these different field names are just retained for compatibility in case anyone is using them
 		self.fStdout = self.stdout
 		self.fStderr = self.stderr
 
-	def writeStdin(self):
-		"""Method to write to the process stdin pipe.
-		
-		"""
-		while self._outQueue:
-			try:
-				data = self._outQueue.get(block=True, timeout=0.25)
-			except Queue.Empty:
-				if not self.running():
-					break
+
+	def _writeStdin(self, data):
+		with self.__lock:
+			if not self.__stdin: return
+			if data is None:
+				win32file.CloseHandle(self.__stdin)
 			else:
-				with self.__lock:
-					if self.__stdin:
-						win32file.WriteFile(self.__stdin, data, None)
+				win32file.WriteFile(self.__stdin, data, None)
 
+	def __quoteCommand(self, input):
+		"""Private method to quote a command (argv[0]) "correctly" for Windows.
 
-	def __quotePath(self, input):
-		"""Private method to escape a windows path according to documented guidelines for this OS.
+		The returned value can be used as the start of a command line, with subsequent
+		arguments quoted using __quoteArgument() and added to the command line with
+		intervening spaces.
 		
+		The quoted command will be handled correctly by the standard Windows command
+		line parsers (CommandLineToArgvW and parse_cmdline), unless the input includes
+		double quotes, control characters, or whitespace other than spaces.  The
+		behaviour of the standard parsers is different in those cases, and given that
+		there is no way of knowing which parser the command will actually use, no
+		attempt is made to deal with these differences and the results are undefined.
 		"""
-		return '\"%s\"'%input.replace('"', '""')
+		return '\"%s\"' % input if ' ' in input else input
+
+	def __quoteArgument(self, input):
+		"""Private method to quote and escape a command line argument correctly for Windows.
+
+		The returned value can be added to the end of a command line, with an intervening
+		space, and will be treated as a separate argument by the standard Windows command
+		line parsers (CommandLineToArgvW and parse_cmdline).  Double quotes, whitespace
+		and backslashes in the argument will be preserved for the parser to see them.
+		
+		Windows' quoting and escaping rules are somewhat complex and the implementation
+		of this method was derived from a few different sources:
+		https://docs.microsoft.com/en-us/previous-versions/17w5ykft(v=vs.85)
+		http://www.windowsinspired.com/the-correct-way-to-quote-command-line-arguments/
+		http://www.windowsinspired.com/understanding-the-command-line-string-and-arguments-received-by-a-windows-program/
+		http://www.windowsinspired.com/how-a-windows-programs-splits-its-command-line-into-individual-arguments/
+		https://daviddeley.com/autohotkey/parameters/parameters.htm
+		This method tries to avoid any areas of different behaviour between the two
+		standard parsers, in particular the undocumented rules around handling of
+		consecutive unescaped double quote characters.
+		"""
+		whitespace = None
+		# Short-circuit some easy and common cases:
+		# - No quotes, no whitespace (just return the input unchanged)
+		# - No quotes, no trailing backslash, whitespace (wrap in double quotes)
+		# Everything else falls through to the more complex algorithm
+		if '\"' not in input:
+			empty = (len(input) == 0)
+			whitespace = (empty or ' ' in input or '\t' in input)
+			if not whitespace: return input
+			if not empty and input[-1] != '\\': return '\"%s\"' % input
+		# Make sure we look for whitespace exactly once
+		if whitespace is None: whitespace = (' ' in input or '\t' in input)
+
+		output = []
+		backslash = 0
+		for ch in input:
+			# Count backslashes until we hit a non-backslash
+			if ch == '\\':
+				backslash += 1
+			elif ch == '\"':
+				# Add any pending backslashes (escaped)
+				# Then add the escaped double quote
+				output.extend([2 * backslash * '\\', '\\\"'])
+				backslash = 0
+			else:
+				# Add any pending backslashes (unescaped)
+				# Then add the next character
+				output.extend([backslash * '\\', ch])
+				backslash = 0
+		if whitespace:
+			# Add any pending backslashes (escaped)
+			# Wrap the whole argument in double quotes
+			output.extend([2 * backslash * '\\', '\"'])
+			output.insert(0, '\"')
+		else:
+			# Add any pending backslashes (unescaped)
+			output.append(backslash * '\\')
+		return ''.join(output)
+
+	def __buildCommandLine(self, command, args):
+		""" Private method to build a Windows command line from a command plus argument list.
+		
+		Returns both the quoted command (argv[0]) and the fully quoted and escaped command
+		line (including the command), because both are used elsewhere in this class.
+		"""
+		new_command = self.__quoteCommand(command)
+		command_line = [new_command]
+		for arg in args: command_line.append(self.__quoteArgument(arg))
+		return new_command, ' '.join(command_line)
 
 	def startBackgroundProcess(self):
 		"""Method to start a process running in the background.
@@ -140,10 +208,10 @@ class ProcessImpl(Process):
 	
 			# create pipes for the process to write to
 			hStdin_r, hStdin = win32pipe.CreatePipe(sAttrs, 0)
-			hStdout = win32file.CreateFile(_stringToUnicode(self.stdout), win32file.GENERIC_WRITE | win32file.GENERIC_READ,
+			hStdout = win32file.CreateFile(self.stdout, win32file.GENERIC_WRITE | win32file.GENERIC_READ,
 			   win32file.FILE_SHARE_DELETE | win32file.FILE_SHARE_READ | win32file.FILE_SHARE_WRITE,
 			   sAttrs, win32file.CREATE_ALWAYS, win32file.FILE_ATTRIBUTE_NORMAL, None)
-			hStderr = win32file.CreateFile(_stringToUnicode(self.stderr), win32file.GENERIC_WRITE | win32file.GENERIC_READ,
+			hStderr = win32file.CreateFile(self.stderr, win32file.GENERIC_WRITE | win32file.GENERIC_READ,
 			   win32file.FILE_SHARE_DELETE | win32file.FILE_SHARE_READ | win32file.FILE_SHARE_WRITE,
 			   sAttrs, win32file.CREATE_ALWAYS, win32file.FILE_ATTRIBUTE_NORMAL, None)
 			  
@@ -166,13 +234,12 @@ class ProcessImpl(Process):
 
 				# start the process, and close down the copies of the process handles
 				# we have open after the process creation (no longer needed here)
-				old_command = command = self.__quotePath(self.command)
-				for arg in self.arguments: command = '%s %s' % (command, self.__quotePath(arg))
+				new_command, command_line = self.__buildCommandLine(self.command, self.arguments)
 				
 				# Windows CreateProcess maximum lpCommandLine length is 32,768
 				# http://msdn.microsoft.com/en-us/library/ms682425%28VS.85%29.aspx
-				if len(command)>=32768: # pragma: no cover
-					raise ValueError("Command line length exceeded 32768 characters: %s..."%command[:1000])
+				if len(command_line)>=32768: # pragma: no cover
+					raise ValueError("Command line length exceeded 32768 characters: %s..."%command_line[:1000])
 
 				dwCreationFlags = 0
 				if IS_PRE_WINDOWS_8: # pragma: no cover
@@ -189,10 +256,10 @@ class ProcessImpl(Process):
 				self.__job = self._createParentJob()
 
 				try:
-					self.__hProcess, self.__hThread, self.pid, self.__tid = win32process.CreateProcess( None, command, None, None, 1, 
+					self.__hProcess, self.__hThread, self.pid, self.__tid = win32process.CreateProcess( None, command_line, None, None, 1, 
 						dwCreationFlags, self.environs, os.path.normpath(self.workingDir), StartupInfo)
 				except pywintypes.error as e:
-					raise ProcessError("Error creating process %s: %s" % (old_command, e))
+					raise ProcessError("Error creating process %s: %s" % (new_command, e))
 
 				try:
 					if not self.disableKillingChildProcesses:
@@ -252,11 +319,9 @@ class ProcessImpl(Process):
 			return self.exitStatus
 
 
-	def stop(self, timeout=TIMEOUTS['WaitForProcessStop']): 
-		"""Stop a process running.
-		
-		@raise ProcessError: Raised if an error occurred whilst trying to stop the process
-		
+	def stop(self, timeout=TIMEOUTS['WaitForProcessStop'], hard=False): 
+		"""Stop a process running. On Windows this is always a hard termination. 
+	
 		"""
 		try:
 			with self.__lock:
@@ -279,5 +344,28 @@ class ProcessImpl(Process):
 			self.wait(timeout=timeout)
 		except Exception as ex: # pragma: no cover
 			raise ProcessError("Error stopping process: %s"%ex)
+
+
+	def _pollWaitUnlessProcessTerminated(self):
+		# While waiting for process to terminate, Windows gives us a way to block for completion without polling, so we 
+		# can use a larger timeout to avoid wasting time in the Python GIL (but not so large as to stop us from checking for abort
+
+		__hProcess = self.__hProcess # read it atomically
+
+		if __hProcess:
+			owner = self.owner
+			waitobjects = [__hProcess]
+			if owner and (owner.isCleanupInProgress is False) and owner.isInterruptTerminationInProgressEvent: 
+				waitobjects.append(owner.isInterruptTerminationInProgressEvent)
+
+			# In theory we could increase this timeout to further reduce contention on the Python GIL but 
+			# not doing so yet since in single-threaded mode the interrupt signal is not delivered while the 
+			# main thread is busy in the WaitForMultipleObjects call so need to keep this slow to allow responsive Ctrl+C for now
+			pollTimeoutMillis = 1000
+			if win32event.WaitForMultipleObjects(waitobjects, False, pollTimeoutMillis) != win32event.WAIT_FAILED:
+				if owner and owner.isInterruptTerminationInProgress is True and owner.isCleanupInProgress is False: raise KeyboardInterrupt()
+				return
+		
+		self._pollWait() # fallback to a sleep to avoid spinning if an unexpected return code is returned
 
 ProcessWrapper = ProcessImpl # old name for compatibility

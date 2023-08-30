@@ -14,6 +14,8 @@ import os
 import sys
 import shutil
 from typing import List, Dict, Tuple
+from sphinx.util import logging
+logger = logging.getLogger('conf.py')
 
 DOC_SOURCE_DIR = os.path.dirname(__file__)
 PYSYS_ROOT_DIR = os.path.abspath(DOC_SOURCE_DIR+'/..')
@@ -41,26 +43,26 @@ project = f'PySys v{pysys_release}'
 
 sys.path.append(DOC_SOURCE_DIR+'/ext') # temporary measure to get sphinx_autodocgen
 
-assert os.path.exists(DOC_SOURCE_DIR+'/ProjectConfiguration.rst'), 'must run setup.py first, to generate docs/ProjectConfig.rst'
+assert os.path.exists(DOC_SOURCE_DIR+'/pysys/ProjectConfiguration.rst'), 'must run setup.py first, to generate docs/pysys/ProjectConfig.rst'
 
-# To refer to another .rst document use                  :doc:`TestDescriptors`
-# To refer to a section inside another .rst document use :ref:`TestDescriptors:Sample pysysdirconfig.xml`
+# To refer to another .rst document use                  :doc:`/pysys/TestDescriptors`
+# To refer to a section inside another .rst document use :ref:`pysys/TestDescriptors:Sample pysysdirconfig.xml`
 
 # Add any Sphinx extension module names here, as strings. They can be
 # extensions coming with Sphinx (named 'sphinx.ext.*') or your custom
 # ones.
 extensions = [
-    'sphinx.ext.autodoc',
-    'sphinx.ext.autosummary',
-    'sphinx.ext.autosectionlabel',
-    'sphinx.ext.viewcode',
+	'sphinx.ext.autodoc',
+	'sphinx.ext.autosummary',
+	'sphinx.ext.autosectionlabel',
+	'sphinx.ext.viewcode',
 	'sphinx_epytext',
 	'sphinx_autodocgen',
 ]
 
 default_role = 'py:obj' # So that `xxx` is converted to a Python reference. Use ``xxx`` for monospaced non-links.
 
-autosectionlabel_prefix_document = True
+autosectionlabel_prefix_document = True # namespaces :ref: links with "pysys/rstFileName:"
 
 autoclass_content = 'both' # include __init__ params in doc strings for class
 
@@ -80,8 +82,21 @@ autodoc_default_options = {
 
 #nitpicky = True # so we get warnings about broken links
 
-from sphinx.util import logging
-logger = logging.getLogger('conf.py')
+autosummary_generate = True
+autosummary_generate_overwrite = False
+
+import pysys.basetest
+autodocgen_config = {
+	'modules':[pysys], 
+	'generated_source_dir': DOC_SOURCE_DIR+'/autodocgen/',
+	'skip_module_regex': '(.*[.]__|pysys.basetest)', # if module matches this then it and any of its submodules will be skipped
+	'write_documented_items_output_file': PYSYS_ROOT_DIR+'/docs/build_output/autodocgen_documented_items.txt',
+	'autodoc_options_decider': { # for usability, it's best to fold the inherited ProcessUser content into BaseTest/BaseRunner
+		'pysys.basetest.BaseTest':    { 'inherited-members':True },
+		'pysys.baserunner.BaseRunner':{ 'inherited-members':True },
+	},
+	'module_title_decider': lambda modulename: 'API Reference' if modulename=='pysys' else modulename,
+}
 
 def autodoc_skip_member(app, what, name, obj, skip, options):
 	# nb: 'what' means the parent that the "name" item is in e.g. 'class', 'module'
@@ -99,22 +114,6 @@ def autodoc_skip_member(app, what, name, obj, skip, options):
 		
 	return None
 
-autosummary_generate = True
-autosummary_generate_overwrite = False
-
-import pysys.basetest
-autodocgen_config = {
-	'modules':[pysys], 
-	'generated_source_dir': DOC_SOURCE_DIR+'/autodocgen/',
-	'skip_module_regex': '(.*[.]__|pysys.basetest)', # if module matches this then it and any of its submodules will be skipped
-	'write_documented_items_output_file': PYSYS_ROOT_DIR+'/docs/build_output/autodocgen_documented_items.txt',
-	'autodoc_options_decider': { # for usability, it's best to fold the inherited ProcessUser content into BaseTest/BaseRunner
-		'pysys.basetest.BaseTest':    { 'inherited-members':True },
-		'pysys.baserunner.BaseRunner':{ 'inherited-members':True },
-	},
-	'module_title_decider': lambda modulename: 'API Reference' if modulename=='pysys' else modulename,
-}
-
 def setup(app):
 	app.connect("autodoc-skip-member", autodoc_skip_member)
 
@@ -123,7 +122,8 @@ def setup(app):
 		open(outputdir+'/.nojekyll', 'wb').close()
 	app.connect('build-finished', supportGitHubPages)
 
-
+#############################
+# HTML output options
 # Add any paths that contain templates here, relative to this directory.
 templates_path = ['_templates']
 

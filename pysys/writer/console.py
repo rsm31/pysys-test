@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-# PySys System Test Framework, Copyright (C) 2006-2020 M.B. Grieve
+# PySys System Test Framework, Copyright (C) 2006-2022 M.B. Grieve
 
 # This library is free software; you can redistribute it and/or
 # modify it under the terms of the GNU Lesser General Public
@@ -34,12 +34,12 @@ import zipfile
 import locale
 import shutil
 import shlex
+import json
 
 from pysys.constants import *
 from pysys.writer.api import *
 from pysys.utils.logutils import ColorLogFormatter, stripANSIEscapeCodes, stdoutPrint
 from pysys.utils.fileutils import mkdir, deletedir, toLongPathSafe, fromLongPathSafe, pathexists
-from pysys.utils.pycompat import PY2, openfile
 from pysys.exceptions import UserError
 
 log = logging.getLogger('pysys.writer')
@@ -93,11 +93,14 @@ class ConsoleProgressResultsWriter(BaseProgressResultsWriter):
 		log = logging.getLogger('pysys.resultsprogress')
 		
 		id = self.testToDisplay(testObj, cycle)
-		self.inprogress.remove(id)
+		if id in self.inprogress:
+			self.inprogress.remove(id)
+		else:
+			self.numTests += 1 # it's an unplanned/dynamic test
 		
 		outcome = testObj.getOutcome()
 		self.outcomes[outcome] += 1
-		
+		 
 		executed = sum(self.outcomes.values())
 		
 		if outcome.isFailure():
@@ -128,7 +131,7 @@ class ConsoleProgressResultsWriter(BaseProgressResultsWriter):
 
 class ConsoleFailureAnnotationsWriter(BaseRecordResultsWriter):
 	"""Writer that prints a single annotation line to stdout for each test failure, for IDEs 
-	and CI providers that can highlight failures found by regular expression stdout parsing.
+	and CI providers that can highlight failures using regular expression stdout parsing.
 	
 	An instance of this writer is automatically added to every project, and enables itself only 
 	if the ``PYSYS_CONSOLE_FAILURE_ANNOTATIONS`` environment variable is set. 
@@ -139,12 +142,12 @@ class ConsoleFailureAnnotationsWriter(BaseRecordResultsWriter):
 	
 	format = ""
 	"""
-	The format that will be written to stdout. If not specified as a writer property in pysysproject.xml, the 
-	environment variable ``PYSYS_CONSOLE_FAILURE_ANNOTATIONS`` will be used as the format. 
+	The format that will be written to stdout. If the ``PYSYS_CONSOLE_FAILURE_ANNOTATIONS`` environment variable is 
+	set, the environment will be used instead. 
 	
 	The format can include the following placeholders:
 	
-		- ``@testFile@``: the absolute path to the test file (e.g. run.py), using platform-specific slashes.
+		- ``@testFile@``: the absolute path to the test file (e.g. pysystest.py/run.py), using platform-specific slashes.
 		- ``@testFile/@``: the absolute path to the test file, using forward slashes on all OSes.
 		- ``@testFileLine@``: the line number in the test file (if available, else 0).
 		- ``@runLogFile@``: the absolute path to the run log (e.g. run.log), using platform-specific slashes.
@@ -153,9 +156,12 @@ class ConsoleFailureAnnotationsWriter(BaseRecordResultsWriter):
 		- ``@outcome@``: the outcome e.g. ``FAILED``.
 		- ``@outcomeReason@``: the string containing the reason for the failure; this string can 
 		  contain any characters (other than newline).
-		- ``@testIdAndCycle@``: the test identifier, with a cycle suffix if this is a multi-cycle test.
+		- ``@testIdAndCycle@``: the test identifier, with an optional cycle suffix if this is a multi-cycle test run.
+		- ``@json@``: a JSON dict suitable for machine-parsing; see `pysys.writer.outcomes.JSONResultsWriter` for details. 
+		  Added in v2.1. 
 	
-	The default format if the environment variable is empty and format is not provided is `DEFAULT_FORMAT`. 
+	The default format when the environment variable is empty and a format configuration is not provided is 
+	given by `DEFAULT_FORMAT`. 
 	"""
 	
 	DEFAULT_FORMAT = "@testFile@:@testFileLine@: @category@: @outcome@ - @outcomeReason@ (@testIdAndCycle@)"
@@ -164,7 +170,7 @@ class ConsoleFailureAnnotationsWriter(BaseRecordResultsWriter):
 
 	The output looks like this::
 	
-		c:\\myproject\\tests\\MyTest_001\\run.py:4: error: TIMED OUT - This test timed out (MyTest_001 [CYCLE 03])
+		c:\\myproject\\tests\\MyTest_001\\pysystest.py:4: error: TIMED OUT - This test timed out (MyTest_001 [CYCLE 03])
 	
 	which is similar to output from "make" and so should be parseable by many tools and IDEs. 
 	
@@ -174,11 +180,17 @@ class ConsoleFailureAnnotationsWriter(BaseRecordResultsWriter):
 	"""
 	In addition to failure outcomes, any outcomes listed here (as comma-separated display names) will be reported 
 	(with a ``@category@`` of ``warning`` rather than ``error``). 
+	
+	To include all non-failure outcomes, set this to the special value ``"*"``. 
+	
+	The environment variable ``PYSYS_CONSOLE_FAILURE_ANNOTATIONS_INCLUDE_OUTCOMES`` can be used to overriden the value of 
+	this configuration option, for example set it to ``*`` to include all outcomes. 
 	"""
 	
 	enableIfEnvironmentVariable = "PYSYS_CONSOLE_FAILURE_ANNOTATIONS"
 	"""
-	The environment variable used to control whether it is enabled. 
+	The environment variable used to control whether it is enabled. If it is set to any value other than ``true`` then 
+	its value will be used to determine the format (see above). 
 	
 	This writer will be enabled if the specified environment variable is set (either to any empty string or to any 
 	value other than "false"). 
@@ -187,15 +199,23 @@ class ConsoleFailureAnnotationsWriter(BaseRecordResultsWriter):
 	"""
 
 	def setup(self, cycles=-1, **kwargs):
+		from pysys.writer.outcomes import JSONResultsWriter
+		self.__jsonWriter = JSONResultsWriter(logfile='__pysys_ConsoleFailureAnnotationsWriter_dummy.shouldnotexist')
+		self.__jsonWriter.fp = io.StringIO() # to stop it creating an actual file
+		self.__jsonWriter.setup(cycles=cycles, **kwargs)
+	
 		for k in self.pluginProperties: 
 			if not hasattr(type(self), k): raise UserError('Unknown property "%s" for %s'%(k, self))
 
 		super(ConsoleFailureAnnotationsWriter, self).setup(cycles=cycles, **kwargs)
 		self.cycles=cycles
-		self.format = self.format or os.getenv('PYSYS_CONSOLE_FAILURE_ANNOTATIONS','') or self.DEFAULT_FORMAT
-		if self.format.lower()=='true': self.format = self.DEFAULT_FORMAT
+		if os.getenv('PYSYS_CONSOLE_FAILURE_ANNOTATIONS','').lower() not in ['', 'true']:
+			self.format = os.environ['PYSYS_CONSOLE_FAILURE_ANNOTATIONS']
+		else:
+			self.format = self.format or self.DEFAULT_FORMAT
 		
-		self.includeNonFailureOutcomes = [o.strip().upper() for o in self.includeNonFailureOutcomes.split(',') if o.strip()]
+		includeNonFailureOutcomes = os.getenv('PYSYS_CONSOLE_FAILURE_ANNOTATIONS_INCLUDE_OUTCOMES','') or self.includeNonFailureOutcomes
+		self.includeNonFailureOutcomes = [str(o) for o in OUTCOMES] if includeNonFailureOutcomes=='*' else [o.strip().upper() for o in includeNonFailureOutcomes.split(',') if o.strip()]
 		for o in self.includeNonFailureOutcomes:
 			if not any(o == str(outcome) for outcome in OUTCOMES):
 				raise UserError('Unknown outcome display name "%s" in includeNonFailureOutcomes'%o)
@@ -216,8 +236,11 @@ class ConsoleFailureAnnotationsWriter(BaseRecordResultsWriter):
 		else:
 			return
 		
-		loc = testObj.getOutcomeLocation()
-		if not loc[0]: loc = (os.path.normpath(testObj.output+'/run.log'), 0) # this is a reasonable fallback
+		loc = testObj.getOutcomeLocation() # typically (pysystest.py,linenumber)
+		if not loc[0]: # fallback for if there was no location e.g. because it wasn't a failure
+			loc = (os.path.normpath(os.path.join(testObj.descriptor.testDir,
+				testObj.descriptor._getTestFile()
+				)), 0) # this is a reasonable fallback
 		stdoutPrint(self.format\
 			.replace('@testFile@', self.escape(loc[0]))
 			.replace('@testFile/@', self.escape((loc[0]).replace(os.sep,'/')))
@@ -228,6 +251,7 @@ class ConsoleFailureAnnotationsWriter(BaseRecordResultsWriter):
 			.replace('@outcome@', str(testObj.getOutcome()))
 			.replace('@outcomeReason@', self.escape(testObj.getOutcomeReason() or '(no outcome reason)'))
 			.replace('@testIdAndCycle@', self.escape(testObj.descriptor.id+(' [CYCLE %02d]'%(cycle+1) if self.cycles>1 else '')))
+			.replace('@json@', json.dumps(self.__jsonWriter.createTestResultDict(testObj, **kwargs)) if '@json@' in self.format else '@json@')
 			)
 	
 	def escape(self, str):

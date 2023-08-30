@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-# PySys System Test Framework, Copyright (C) 2006-2020 M.B. Grieve
+# PySys System Test Framework, Copyright (C) 2006-2022 M.B. Grieve
 
 # This library is free software; you can redistribute it and/or
 # modify it under the terms of the GNU Lesser General Public
@@ -51,6 +51,9 @@ The most common type of writer is the standard 'Record' writer, but there are al
      that did not pass. 
      Summary writers are always enabled regardless of the flags given to the PySys launcher.
 
+(See also `pysys.perf.api` whcih is used for writing performance results, using a similar but slightly 
+different API).
+
 Project configuration of the writers is through the PySys project XML file using the ``<writer>`` tag. Multiple
 writers may be configured and their individual properties set through the nested ``<property>`` tag. Writer
 properties are set as attributes to the writer instance just before setup is called, with automatic conversion of 
@@ -92,8 +95,9 @@ import shlex
 from pysys.constants import *
 from pysys.utils.logutils import ColorLogFormatter, stripANSIEscapeCodes, stdoutPrint
 from pysys.utils.fileutils import mkdir, deletedir, toLongPathSafe, fromLongPathSafe, pathexists
-from pysys.utils.pycompat import PY2, openfile
 from pysys.exceptions import UserError
+import pysys.config.project
+import pysys.process.user
 
 log = logging.getLogger('pysys.writer')
 
@@ -269,10 +273,10 @@ class ArtifactPublisher(object):
 		:param str path: Absolute path of the file or directory, using forward slashes as the path separator. 
 		:param str category: A string identifying what kind of artifact this is, e.g. 
 			"TestOutputArchive" and "TestOutputArchiveDir" (from `pysys.writer.testoutput.TestOutputArchiveWriter`) or 
-			"CSVPerformanceReport" (from `pysys.utils.perfreporter.CSVPerformanceReporter`). 
+			"CSVPerformanceReport" (from `pysys.perf.reporters.CSVPerformanceReporter`). 
 			If you create your own category, be sure to add an org/company name prefix to avoid clashes.
 		"""
-		pass
+		pass # pragma: no cover
 
 
 class TestOutputVisitor(object):
@@ -285,7 +289,7 @@ class TestOutputVisitor(object):
 	"""
 
 	def visitTestOutputFile(self, testObj, path, **kwargs):
-		"""
+		r"""
 		Called after execution of each test (and before purging of files) for each file found in the output 
 		directory. 
 		
@@ -310,12 +314,14 @@ class TestOutcomeSummaryGenerator(BaseResultsWriter):
 	"""Configures whether the summary includes the reason for each failure."""
 	
 	showOutputDir = True
-	"""Configures whether the summary includes the (relative) path to the output directory for each failure. """
+	"""Configures whether the summary includes the path to the output directory for each failure. 
+	This is relative to the current working directory unless project property ``pysysLogAbsolutePaths`` is True."""
 
 	showTestDir = True
-	"""Configures whether the summary includes the (relative) path to the test directory for each failure, 
+	"""Configures whether the summary includes the path to the test directory for each failure, 
 	unless the output dir is displayed and the test dir is a parent of it. 
-	This is useful if you run tests with an absolute --outdir. """
+	This is useful if you run tests with an absolute --outdir. 
+	This path is logged relative to the current working directory unless project property ``pysysLogAbsolutePaths`` is True."""
 
 	showTestTitle = False
 	"""Configures whether the summary includes the test title for each failure. """
@@ -415,7 +421,7 @@ class TestOutcomeSummaryGenerator(BaseResultsWriter):
 		if showRunDetails:
 			log("Run details:")
 			for k, v in self.runner.runDetails.items():
-				log(" %23s%s", k+': ', v, extra=ColorLogFormatter.tag(LOG_TEST_DETAILS, 1))
+				log(" %23s%s", k+': ', '%s'%v, extra=ColorLogFormatter.tag(LOG_TEST_DETAILS, 1))
 			log("")
 
 		if showOutcomeStats:
@@ -428,6 +434,9 @@ class TestOutcomeSummaryGenerator(BaseResultsWriter):
 			log('')
 
 		def logForOutcome(decider):
+			mayberelpath = os.path.relpath
+			if pysys.config.project.Project.getInstance().getProperty('pysysLogAbsolutePaths', False): mayberelpath = lambda p:p
+
 			for cycle in self.results:
 				cyclestr = ''
 				if len(self.results) > 1: cyclestr = '[CYCLE %d] '%(cycle+1)
@@ -445,8 +454,8 @@ class TestOutcomeSummaryGenerator(BaseResultsWriter):
 							log("      %s", reason, extra=ColorLogFormatter.tag(LOG_TEST_OUTCOMES))
 							
 						try:
-							outputdir = os.path.normpath(os.path.relpath(fromLongPathSafe(outputdir)))+os.sep
-							testDir = os.path.normpath(os.path.relpath(fromLongPathSafe(testDir)))+os.sep
+							outputdir = os.path.normpath(mayberelpath(fromLongPathSafe(outputdir)))+os.sep
+							testDir = os.path.normpath(mayberelpath(fromLongPathSafe(testDir)))+os.sep
 						except Exception as ex: # relpath can fail if on different Windows drives
 							logging.getLogger('pysys.writer').debug('Failed to generate relative paths for "%s" and "%s": %s', outputdir, testDir, ex)
 							
@@ -473,9 +482,13 @@ class TestOutcomeSummaryGenerator(BaseResultsWriter):
 				for outcome, tests in self.results[cycle].items():
 					if outcome.isFailure(): fails = fails + len(tests)
 			if fails == 0:
-				log("	THERE WERE NO FAILURES", extra=ColorLogFormatter.tag(LOG_PASSES))
+				log("  THERE WERE NO FAILURES", extra=ColorLogFormatter.tag(LOG_PASSES))
 			else:
 				logForOutcome(lambda outcome: outcome.isFailure())
+
+			if pysys.process.user.ProcessUser.isInterruptTerminationInProgress:
+				didNotStart = self.numTests-sum(self.outcomes.values())
+				log("  TERMINATED EARLY%s"%('; %d TESTS DID NOT START'%didNotStart if didNotStart else ''), extra=ColorLogFormatter.tag(LOG_FAILURES))
 			log('')
 
 		if showTestIdList:

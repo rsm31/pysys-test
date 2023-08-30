@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<pysysdirconfig>
+    <modes>
+      <mode>rootmode1_</mode> <!-- trailing _ will be stripped off when combining modes -->
+      <mode mode="rootmode2"/> <!-- attribute is equivalent to the mode form -->
+    </modes>
+
+</pysysdirconfig>

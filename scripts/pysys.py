@@ -1,5 +1,5 @@
-#!/usr/bin/env python
-# PySys System Test Framework, Copyright (C) 2006-2019 M.B. Grieve
+#!/usr/bin/env python3
+# PySys System Test Framework, Copyright (C) 2006-2022 M.B. Grieve
 
 # This library is free software; you can redistribute it and/or
 # modify it under the terms of the GNU Lesser General Public
@@ -16,13 +16,13 @@
 # Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
 
 
+if __name__ == "__main__": 
+	# the sys.path starts with the directory containing pysys.py which can lead to Python 
+	# mistaking this file for the pysys package; regardless, it's not needed for locating 
+	# the pysys modules since those will be in site-packages once pysys is installed
+	import os, sys
+	script_path = os.path.normcase(os.path.abspath(sys.path[0]))
+	sys.path = [p for p in sys.path if os.path.normcase(os.path.abspath(p)) != script_path]
 
-# the sys.path starts with the directory containing pysys.py which we want to remove as
-# that dir might be anywhere and could contain anything; it's not needed for locating 
-# the pysys modules since those will be in site-packages once pysys is installed
-import os, sys
-script_path = os.path.abspath(sys.path[0])
-sys.path = [p for p in sys.path if os.path.abspath(p) != script_path]
-
-from pysys import __main__
-__main__.main()
+	from pysys import __main__
+	__main__.main()

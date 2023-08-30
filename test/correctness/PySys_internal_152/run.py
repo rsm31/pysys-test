@@ -11,8 +11,8 @@ class PySysTest(BaseTest):
 
 		sampledir = self.project.testRootDir+'/../samples'
 		
-		pythonVersionForCI = "3.8"
-		pythonVersionForMin = "3.6"
+		pythonVersionForCI = "3.11"
+		pythonVersionForMin = "3.7"
 		
 		pysysVersion = pysys.__version__
 		if 'dev' in pysysVersion: pysysVersion = pysysVersion[:pysysVersion.find('.dev')]
@@ -36,15 +36,15 @@ class PySysTest(BaseTest):
 				if f.endswith('.xml') and f not in ['input.xml']:
 					self.assertGrep(p, '^  .*', contains=False) # check indentation is with tabs not spaces
 					self.assertGrep(p, '^<[?]xml version="1.0" encoding="utf-8"[?]>$') # proper XML header with encoding explicitly specified
-				if f == 'pysystest.xml':
-					self.assertGrep(p, '^<pysystest type="[^"]+">$')
+				if f == 'pysystest.xml' and 'ManualTester' not in p and 'PySysTestXMLDescriptorSample' not in p:
+					self.assertGrep(p, '^<pysystest>$')
 				if f == 'pysysproject.xml':
 					self.assertThatGrep(p, '<requires-python>(.*)</requires-python>', expected=pythonVersionForMin)	
 					self.assertThatGrep(p, '<requires-pysys>(.*)</requires-pysys>', 'value == pysysVersion', pysysVersion=pysysVersion)
 				
 				if f == 'pysys-test.yml': # GitHub Actions workflow
 					self.assertThatGrep(p, ' pip install pysys==(.*)', 'value == pysysVersion', pysysVersion=pysysVersion)
-					self.assertThatGrep(p, ' python-version: (.*)', 'value == pythonVersionForCI', pythonVersionForCI=pythonVersionForCI)
+					self.assertThatGrep(p, ' python-version: "?([^"]+)"?', 'value == pythonVersionForCI', pythonVersionForCI=pythonVersionForCI)
 
 				if f == 'run.py':
 					self.assertGrep(p, 'import pysys') # new-style test not an old one we copied from somewhere

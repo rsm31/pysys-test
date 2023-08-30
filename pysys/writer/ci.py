@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-# PySys System Test Framework, Copyright (C) 2006-2020 M.B. Grieve
+# PySys System Test Framework, Copyright (C) 2006-2022 M.B. Grieve
 
 # This library is free software; you can redistribute it and/or
 # modify it under the terms of the GNU Lesser General Public
@@ -41,9 +41,10 @@ import time, logging, sys, threading, os, re, collections
 from pysys.constants import PrintLogs, OUTCOMES
 from pysys.writer.api import BaseRecordResultsWriter, TestOutcomeSummaryGenerator, ArtifactPublisher, stripANSIEscapeCodes
 from pysys.utils.logutils import ColorLogFormatter, stdoutPrint
-from pysys.utils.pycompat import PY2
 
 log = logging.getLogger('pysys.writer')
+
+github_log = logging.getLogger('pysys.writer.github')
 
 class GitHubActionsCIWriter(BaseRecordResultsWriter, TestOutcomeSummaryGenerator, ArtifactPublisher):
 	"""
@@ -106,14 +107,18 @@ class GitHubActionsCIWriter(BaseRecordResultsWriter, TestOutcomeSummaryGenerator
 				.replace('\r', '%0D')\
 				.replace('\n', '%0A')
 				)
-		if cmd in [u'set-output']: # since GitHub suppresses the actual commands written, it's useful to log this at debug
-			log.debug('GitHub Actions command %s', toprint)
+		# since GitHub suppresses the actual commands written, it's useful to log this at debug
+		github_log.debug('GitHub Actions command %s', toprint)
 
 		stdoutPrint(toprint)
+		
+		assert cmd != 'set-output', '::set-output is deprecated by GitHub; please call PySys publishArtifact() instead of outputGitHubCommand()'
 
 	def setup(self, numTests=0, cycles=1, xargs=None, threads=0, testoutdir=u'', runner=None, **kwargs):
 		super(GitHubActionsCIWriter, self).setup(numTests=numTests, cycles=cycles, xargs=xargs, threads=threads, 
 			testoutdir=testoutdir, runner=runner, **kwargs)
+			
+		self.__outputs = set()
 		
 		self.remainingAnnotations = int(self.maxAnnotations)-2 # one is used up for the non-zero exit status and one is used for the summary
 		if str(self.failureTestLogAnnotations).lower()!='true': self.remainingAnnotations = 0
@@ -149,8 +154,22 @@ class GitHubActionsCIWriter(BaseRecordResultsWriter, TestOutcomeSummaryGenerator
 			self._publishToGitHub([path], category)
 
 	def _publishToGitHub(self, paths, category):
-		if not os.path.exists(paths[0]): return # auto-skip things that don't exist
-		self.outputGitHubCommand(u'set-output', u','.join(paths), params={u'name':u'artifact_'+category})
+		if not os.path.exists(paths[0]): 
+			github_log.debug('GitHub Actions cannot set output parameter "%s" due to missing files: %s', category, paths)
+			return # auto-skip things that don't exist
+
+		name = 'artifact_'+category
+		val = ','.join(sorted(paths))
+		
+		github_log.debug('GitHub Actions is setting output parameter %s=%s', name, val)
+		if not os.getenv('GITHUB_OUTPUT'):
+			github_log.warning('Cannot set GitHub Actions output "%s" since GITHUB_OUTPUT environment variable is not defined; available env vars=%s', name, ' '.join(sorted(os.environ.keys())))
+			return
+			
+		with open(os.environ['GITHUB_OUTPUT'], 'a') as f: # use default encoding
+			f.write(f'{name}={val}\n')
+			f.flush()
+		self.__outputs.add(name)
 
 	def cleanup(self, **kwargs):
 		super(GitHubActionsCIWriter, self).cleanup(**kwargs)
@@ -180,6 +199,8 @@ class GitHubActionsCIWriter(BaseRecordResultsWriter, TestOutcomeSummaryGenerator
 					self.outputGitHubCommand(*a)
 
 			self.outputGitHubCommand(u'endgroup')
+			if self.__outputs:
+				github_log.info('GitHub output values: %s', ', '.join(sorted(self.__outputs)))
 
 	def processResult(self, testObj, cycle=0, testTime=0, testStart=0, runLogOutput=u'', **kwargs):
 		super(GitHubActionsCIWriter, self).processResult(testObj, cycle=cycle, testTime=testTime, 

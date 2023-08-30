@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-# PySys System Test Framework, Copyright (C) 2006-2020 M.B. Grieve
+# PySys System Test Framework, Copyright (C) 2006-2022 M.B. Grieve
 
 # This library is free software; you can redistribute it and/or
 # modify it under the terms of the GNU Lesser General Public
@@ -28,8 +28,8 @@ implementations of PySys classes described in this API reference:
 
 	- `pysys.baserunner.BaseRunner` to customize orchestration of all the tests in a test run. 
 	- `pysys.writer` classes to customize how test outcomes are recorded.
-	- `pysys.utils.perfreporter.CSVPerformanceReporter` to customize how numeric performance results are reported.
-	- `pysys.xml.descriptor.DescriptorLoader` to customize how PySys find and runs tests (e.g. to support running tests 
+	- `pysys.perf` to customize how numeric performance results are reported.
+	- `pysys.config.descriptor.DescriptorLoader` to customize how PySys find and runs tests (e.g. to support running tests 
 	  from other frameworks within PySys). 
 	- `pysys.utils.logutils.BaseLogFormatter` for advanced customization of log message format.
 
@@ -51,7 +51,7 @@ __maintainer_email__ = "pysys-dev@googlegroups.com"
 __status__  = "Production"
 """The status of this release."""
 
-__version__ = "1.7.0.dev1"
+__version__ = "2.2.dev1"
 """The version of this release."""
 
 __date__ = "yyyy-mm-dd"
@@ -70,8 +70,10 @@ __all__  = [
 	"process",
 	"unit",
 	"utils",
+	"perf",
 	"writer",
-	"xml"
+	"xml", 
+	"config",
 ]
 """The public submodules of PySys."""
 

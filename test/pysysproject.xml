@@ -2,11 +2,11 @@
 <pysysproject>
 
 	<!-- It doesn't matter enormously whether this is kept up to date -->
-	<requires-pysys>1.6.1</requires-pysys>
+	<requires-pysys>2.1</requires-pysys>
 
 
-	<!-- Unlike the samples, we do need to run these with all PySys versions including 2.7 -->
-	<requires-python>2.7.0</requires-python>
+	<!-- Unlike the samples, we do need to run these with all PySys versions we support -->
+	<requires-python>3.7</requires-python>
 
 	<!-- 
 		The following standard project properties are always defined and can be accessed through ${prop} syntax:
@@ -39,7 +39,7 @@
 	BaseTest or BaseRunner classes, or customer test output writers. 
 	-->
 	<pythonpath value="${testRootDir}/pysys-extensions" />
-	<test-plugin classname="pysysinternalhelpers.PySysTestPlugin" alias="pysys"/>
+	<test-plugin classname="pysysinternalhelpers.PySysTestPlugin" alias="pysys"/> <!-- test plugins are no longer recommended, but have not yet ported the internal tests to use helpers -->
 	<runner-plugin classname="pysysinternalhelpers.PySysRunnerPlugin"/>
 
 	<writers>
@@ -76,6 +76,11 @@
 			<property name="showTestTitle" value="true"/>
 		</writer>
 	</writers>
+	
+	<pysysdirconfig>
+		<maker-template name="pysys-in-pysys" description="a test that runs its own PySys project in the input directory" 
+			copy="./_pysys_templates/pysys-in-pysys/*"/>
+	</pysysdirconfig>
 
 	<default-file-encodings>
 		<default-file-encoding pattern="run.log" encoding="utf-8"/>

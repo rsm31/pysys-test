@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-# PySys System Test Framework, Copyright (C) 2006-2020 M.B. Grieve
+# PySys System Test Framework, Copyright (C) 2006-2022 M.B. Grieve
 
 # This library is free software; you can redistribute it and/or
 # modify it under the terms of the GNU Lesser General Public
@@ -23,19 +23,13 @@ The convention is to import all contents of the module so that the constants can
 be referenced directly. 
 
 """
-# undocumented (no longer in public API): ENVSEPERATOR, SITE_PACKAGES_DIR, DEFAULT_STYLESHEET, TRUE, FALSE, loadproject, PROJECT
+# undocumented (no longer in public API): ENVSEPERATOR, SITE_PACKAGES_DIR, DEFAULT_STYLESHEET, TRUE, FALSE, PROJECT
 
 import sys, re, os, os.path, socket, traceback, locale
-
-# if set is not available (>python 2.6) fall back to the sets module
-try:  
-	set  
-except NameError:  
-	import sets
-	from sets import Set as set
+from enum import Enum
 
 from pysys import stdoutHandler
-from pysys.utils.pycompat import Enum
+# do not add extra pysys import here - must keep minimal to avoid possible circular dependencies
 
 # set the platform and platform related constants
 HOSTNAME = socket.getfqdn()
@@ -51,7 +45,17 @@ if re.search('win32', sys.platform):
 	PATH = r'%s;%s\system32;%s\System32\Wbem' % (WINDIR, WINDIR, WINDIR)
 	LD_LIBRARY_PATH = ''
 	DYLD_LIBRARY_PATH = ''
+	
 	LIBRARY_PATH_ENV_VAR = 'PATH'
+	"""
+	The name of the environment variable listing dynamic library paths on this operating system, for example 
+	``LD_LIBRARY_PATH`` on Linux or ``PATH`` on Windows. Use ``os.pathsep`` for joining the paths together. 
+	
+	For example::
+	
+		environs={ LIBRARY_PATH_ENV_VAR: os.path.join([os.getenv(LIBRARY_PATH_ENV_VAR,''), mynewpath]) }
+	"""
+	
 	SITE_PACKAGES_DIR =  os.path.join(sys.prefix, "Lib", "site-packages")
 	
 elif re.search('sunos', sys.platform): # pragma: no cover
@@ -107,7 +111,7 @@ is usually not relevant for testing purposes.
 
 See also `pysys.basetest.BaseTest.getDefaultFileEncoding()`.
 
-.. versionadded:: 1.7.0
+.. versionadded:: 2.0
 """
 
 ENVSEPERATOR = os.pathsep
@@ -169,6 +173,13 @@ FAILED = Outcome('FAILED', isFailure=True)
 """ Failure test `Outcome` indicating validation steps with a negative outcome. """
 TIMEDOUT = Outcome('TIMEDOUT', isFailure=True, displayName='TIMED OUT')
 """ Failure test `Outcome` indicating that the test timed out while performing execution or validation operations. """
+BADPERF = Outcome('BADPERF', isFailure=True, displayName='BAD PERFORMANCE')
+""" Failure test `Outcome` indicating that the measured performance (speed, memory use, etc) was deemed insufficient. 
+When using this outcome, it is always best to also report the underlying numeric values using 
+`pysys.basetest.BaseTest.reportPerformanceResult` to provide a record of how close to the limit the performance has been 
+historically. Note that until other failure outcomes, the ``BADPERF`` outcome will not prevent ``reportPerformanceResult`` 
+from recording subsequent results. 
+"""
 DUMPEDCORE = Outcome('DUMPEDCORE', isFailure=True, displayName='DUMPED CORE')
 """ Failure test `Outcome` indicating that a crash occurred, and a `core` file was generated (UNIX only). """
 BLOCKED = Outcome('BLOCKED', isFailure=True)
@@ -180,7 +191,7 @@ SKIPPED = Outcome('SKIPPED', isFailure=False)
 
 
 # set the precedent for the test outcomes
-OUTCOMES = (SKIPPED, BLOCKED, DUMPEDCORE, TIMEDOUT, FAILED, NOTVERIFIED, INSPECT, PASSED)
+OUTCOMES = (SKIPPED, BLOCKED, DUMPEDCORE, TIMEDOUT, FAILED, BADPERF, NOTVERIFIED, INSPECT, PASSED)
 """
 Lists all possible test outcomes, in descending order of precedence. 
 
@@ -190,12 +201,13 @@ Lists all possible test outcomes, in descending order of precedence.
 	DUMPEDCORE
 	TIMEDOUT
 	FAILED
+	BADPERF
 	NOTVERIFIED
 	INSPECT
 	PASSED
 
 If a test adds multiple outcomes, the outcome with highest precedence is used as the final test outcome 
-(i.e. SKIPPED rather than FAILED, FAILED rather than PASSED etc). 
+(i.e. SKIPPED rather than FAILED, and FAILED rather than PASSED etc). 
 
 Each item is an instance of `Outcome`. Use `Outcome.isFailure()` to check whether a given outcome is classed as a failure for reporting purposes. 
 
@@ -217,15 +229,15 @@ LOOKUP[FALSE] = "FALSE"
 
 # set the default descriptor filename, input, output and reference directory names
 DEFAULT_PROJECTFILE = ['pysysproject.xml']
-DEFAULT_DESCRIPTOR = ['pysystest.xml'] # can be customized with the pysysTestDescriptorFileNames project property
-DEFAULT_MODULE = 'run.py'
+DEFAULT_DESCRIPTOR = ['pysystest.xml'] # deprecated, do not use this. For customization use the pysysTestDescriptorFileNames project property. 
+DEFAULT_MODULE = 'run.py' # deprecated, do not use this. 
 DEFAULT_GROUP = ""
 DEFAULT_TESTCLASS = 'PySysTest'
 DEFAULT_INPUT = 'Input'
 DEFAULT_OUTPUT = 'Output'
 DEFAULT_REFERENCE = 'Reference'
 DEFAULT_RUNNER = 'pysys.baserunner.BaseRunner'
-DEFAULT_MAKER = 'pysys.launcher.console.ConsoleMakeTestHelper'
+DEFAULT_MAKER = 'pysys.launcher.console.DefaultTestMaker'
 DEFAULT_STYLESHEET = None # deprecated
 DEFAULT_FORMAT = u'%(asctime)s %(levelname)-5s %(message)s'
 DEFAULT_OUTDIR = 'win' if PLATFORM=='win32' else PLATFORM # this constant is not currently public API
@@ -270,6 +282,8 @@ LOG_PASSES = 'passed'
 LOG_SKIPS = 'skipped'
 LOG_DIFF_ADDED = 'diff+'
 LOG_DIFF_REMOVED = 'diff-'
+LOG_PERF_BETTER = 'performancebetter'
+LOG_PERF_WORSE = 'performanceworse'
 LOG_END = 'end'
 
 class PrintLogs(Enum):
@@ -285,13 +299,8 @@ class PrintLogs(Enum):
 	FAILURES = 'PrintLogs.FAILURES'
 	"""Detailed run.log output is only printed to the stdout console for failed testcases. """
 
-PROJECT = None
-""":meta private: Hide this since 1.5.1 since we don't want people to use it. 
-
-Holds the L{pysys.xml.project.Project} instance containing settings for this PySys project.
-Instead of using this constant, use `pysys.basetest.BaseTest.project` (or`pysys.process.user.ProcessUser.project`) 
-field to access this. If this is not possible, use Project.getInstance().
-
-This is set by the console_XXX modules when the project is loaded. 
-"""
-from pysys.xml.project import Project # retained for compatibility when using 'from constants import *'
+# Prior to v2.1 the "Project" class and "PROJECT" constant were imported here; the former was removed to avoid circular 
+# dependencies during initialization but for compatibility when using 'from constants import *' in testcases both are 
+# assigned into this module during console_XXX when the project has been loaded. 
+# Instead of using these constants, it is recommended to use the `pysys.basetest.BaseTest.project` 
+# (or`pysys.process.user.ProcessUser.project`) field to access this. If this is not possible, use Project.getInstance().
